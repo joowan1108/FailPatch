@@ -23,7 +23,7 @@ ssh_() { ssh -o BatchMode=yes $SSH_TARGET "$@"; }
 
 # shellcheck disable=SC2068
 for model in ${MODELS[@]}; do
-    for task in $(ssh_ "ls -d $REMOTE/$model/*/buffer 2>/dev/null | xargs -n1 dirname | xargs -n1 basename"); do
+    for task in $(ssh_ "ls $REMOTE/$model/*/buffer_meta.json 2>/dev/null | xargs -r -n1 dirname | xargs -r -n1 basename"); do   # finished buffers only
         if ssh_ "test -f $REMOTE/$model/$task/annotate.done"; then
             echo "[skip] $model/$task already annotated"; continue
         fi
