@@ -54,7 +54,7 @@ Docker 이미지는 DSRL 실험과 같은 `joowan1108/dsrl-robocasa365:v1` 을 �
 템플릿 값은 [docker/VAST_TEMPLATE.md](docker/VAST_TEMPLATE.md) 참고.
 
 ```bash
-cd /workspace/FailPatch-RC365 && tmux new -s failpatch
+cd /workspace/FailPatch && tmux new -s failpatch
 bash setup/check.sh
 export OPENAI_API_KEY=...        # 또는 ANTHROPIC_API_KEY; 없으면 휴리스틱 주석
 
