@@ -89,21 +89,22 @@ def demo_loss(reb, z, target, mask, project, temperature: float, null_enabled: b
     return loss_expert, loss_router, stats
 
 
-def preserve_loss(reb, h):
-    """Reliable states H+: choose Null and keep residual energy small (eq. 10)."""
+def preserve_loss(reb, h, scale: float = 1.0):
+    """Reliable states H+: choose Null and keep residual energy small (eq. 10).
+    `scale` is the typical norm of h; residual energy is measured relative to it (see train.py)."""
     log_p = reb.log_probs(h)
-    energy = reb.deltas(h).pow(2).sum(dim=-1).transpose(0, 1)  # (B, K)
+    energy = (reb.deltas(h) / scale).pow(2).sum(dim=-1).transpose(0, 1)  # (B, K)
     return (-log_p[:, 0] + (log_p[:, 1:].exp() * energy).sum(dim=1)).mean()
 
 
-def redirect_trust_loss(reb, h, proto, lambda_u, temperature, null_margin, lambda_r, margin_r):
+def redirect_trust_loss(reb, h, proto, lambda_u, temperature, null_margin, lambda_r, margin_r, scale: float = 1.0):
     """Failure-associated states H-: route to experts that move the representation toward the
     local success prototype (eqs. 11-13) with bounded intervention (eq. 14).
 
     proto is the prototype in the l2-normalised space, where all distances are measured."""
     dist = lambda x: (F.normalize(x, dim=-1) - proto).norm(dim=-1)  # noqa: E731
     deltas = reb.deltas(h)  # (K, B, d)
-    energy = deltas.pow(2).sum(dim=-1).transpose(0, 1)  # (B, K)
+    energy = (deltas / scale).pow(2).sum(dim=-1).transpose(0, 1)  # (B, K)
     progress = dist(h)[:, None] - dist(h[None] + deltas).transpose(0, 1)  # (B, K)
     with torch.no_grad():
         utility = progress - lambda_u * energy

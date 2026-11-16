@@ -74,6 +74,9 @@ def main():
     parser.add_argument("--null-margin", type=float, default=0.1)
     parser.add_argument("--redirect-margin-weight", type=float, default=0.01)
     parser.add_argument("--redirect-margin", type=float, default=0.1)
+    parser.add_argument("--energy-scale", default="auto",
+                        help="norm that residual energies ||delta h||^2 are measured against; 'auto' = mean norm of "
+                             "the cached action hidden representations, '1' = raw energies as written in the paper")
     parser.add_argument("--demo-only", action="store_true", help="Demo-Only REB baseline of the paper")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
@@ -136,6 +139,19 @@ def main():
     prototype_s = time.time() - tic
 
     # ---- stage 2: optimise the REB --------------------------------------------------------
+    # The paper's energy penalties and utility threshold (lambda_u, lambda_T, m) assume the scale of
+    # pi_0.5's hidden states. XR-1's have norm ~65, so with raw energies moving a representation by
+    # 0.1 in the normalised space would cost lambda_u * 42 = 0.42 > the gain: the Redirect target
+    # would always be Null. Measuring the residual relative to the typical hidden norm makes the
+    # objective independent of the model's hidden scale.
+    if args.energy_scale == "auto":
+        norms = [t.norm(dim=-1).mean() for t in list(plus.values()) + list(minus.values())]
+        if not norms:
+            norms = [z.float().mean(dim=1).norm(dim=-1).mean() for z, _, _ in demo.values()]
+        scale = float(torch.stack(norms).mean())
+    else:
+        scale = float(args.energy_scale)
+    print(f"[train] hidden-norm scale for residual energies: {scale:.2f}", flush=True)
     reb = ResidualExpertBank(adapter.hidden_dim, args.n_experts, args.bottleneck).to(device)
     n_params = sum(p.numel() for p in reb.parameters())
     opt = torch.optim.AdamW(reb.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -177,13 +193,13 @@ def main():
         loss = l_expert + args.lambda_rd * l_router
         stats.update(expert=float(l_expert), router_demo=float(l_router))
         if plus:
-            l_p = preserve_loss(reb, sample(plus, args.batch_size)[0])
+            l_p = preserve_loss(reb, sample(plus, args.batch_size)[0], scale)
             loss = loss + args.lambda_p * l_p
             stats["preserve"] = float(l_p)
         if minus_store:
             h, proto = sample(minus_store, args.batch_size)
             l_r, l_t, extra = redirect_trust_loss(reb, h, proto, args.lambda_u, args.fail_temperature,
-                                                  args.null_margin, args.redirect_margin_weight, args.redirect_margin)
+                                                  args.null_margin, args.redirect_margin_weight, args.redirect_margin, scale)
             loss = loss + args.lambda_r * l_r + args.lambda_t * l_t
             stats.update(redirect=float(l_r), trust=float(l_t), **extra)
         for group in opt.param_groups:
@@ -210,7 +226,7 @@ def main():
         feature_extraction_s=feature_s, prototype_s=prototype_s, optimization_s=optimization_s,
         model_load_s=load_s, steps=args.steps, demo_draws=n_draws,
         trainable_params=n_params, trainable_fraction=n_params / vla_params,
-        buffer_chunks=buffer_stats, peak_gpu_memory_mib=torch.cuda.max_memory_allocated() / 2**20,
+        buffer_chunks=buffer_stats, energy_scale=scale, peak_gpu_memory_mib=torch.cuda.max_memory_allocated() / 2**20,
         final=stats,
     )
     (out / "train_summary.json").write_text(json.dumps(summary, indent=2))
