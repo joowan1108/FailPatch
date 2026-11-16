@@ -4,7 +4,7 @@
 #   2) deployment buffer          -> <model>/<task>/buffer/        (base-policy rollouts)
 #   3) offline annotation         -> <model>/<task>/labels.json
 #   4) FailPatch training (SFT)   -> <model>/reb/reb.pt, train_summary.json
-#   5) FailPatch evaluation       -> <model>/<task>/eval_failpatch.json
+#   5) FailPatch evaluation       -> <model>/<task>/eval_failpatch_$VARIANT.json
 # Finished stages are skipped, so the script can be re-run after an interruption.
 #
 # Two GPUs: run one model per GPU in two shells, e.g.
@@ -30,6 +30,17 @@ DEMO_SAMPLES="${DEMO_SAMPLES:-1000}"
 ANNOTATOR="${ANNOTATOR:-auto}"
 PORT="${PORT:-10086}"
 EXTRA_TRAIN_ARGS="${EXTRA_TRAIN_ARGS:-}"
+# VARIANT selects the training objective; each variant gets its own <model>/reb_<variant> directory
+# and eval_failpatch_<variant>.json, so several can be compared on the same buffers:
+#   paper    hyper-parameters exactly as in the paper (table 5)
+#   adapted  Redirect margins relative to the measured failure/success gap, experts pushed towards
+#            the success prototype from the start, and a stronger push (see README)
+VARIANT="${VARIANT:-adapted}"
+case "$VARIANT" in
+    paper)   VARIANT_ARGS="" ;;
+    adapted) VARIANT_ARGS="--margins relative --redirect-bootstrap --redirect-margin-weight 1.0" ;;
+    *) echo "unknown VARIANT $VARIANT" >&2; exit 1 ;;
+esac
 
 # API key for the offline annotator: keep it out of templates and shell history by putting
 #   export ANTHROPIC_API_KEY=...   (or OPENAI_API_KEY=...)
@@ -98,7 +109,7 @@ done
 
 for model in $MODELS; do
     wait_for_download "$model"
-    mkdir -p "$RESULTS/$model/reb"
+    mkdir -p "$RESULTS/$model/reb_$VARIANT"
     MODEL_T0=$SECONDS
     nvidia-smi -i "$GPU" --query-gpu=timestamp,utilization.gpu,memory.used --format=csv,noheader,nounits -l 10 \
         >> "$RESULTS/$model/gpu_usage.csv" &
@@ -140,26 +151,27 @@ for model in $MODELS; do
     fi
 
     # 4: FailPatch training (all tasks jointly)
-    if [[ ! -f $RESULTS/$model/reb/reb.pt ]]; then
+    if [[ ! -f $RESULTS/$model/reb_$VARIANT/reb.pt ]]; then
         # shellcheck disable=SC2086
-        stage "$RESULTS/$model/reb" train "$MODEL_PY" -u -m failpatch.train --model "$model" "${MODEL_ARGS[@]}" \
-            --tasks $TASKS --results "$RESULTS/$model" --demos "$RESULTS/demos" --out "$RESULTS/$model/reb" $EXTRA_TRAIN_ARGS
+        stage "$RESULTS/$model/reb_$VARIANT" train "$MODEL_PY" -u -m failpatch.train --model "$model" "${MODEL_ARGS[@]}" \
+            --tasks $TASKS --results "$RESULTS/$model" --demos "$RESULTS/demos" --out "$RESULTS/$model/reb_$VARIANT" $VARIANT_ARGS $EXTRA_TRAIN_ARGS
     fi
 
     # 5: evaluation with the REB attached
     need_eval=0
-    for task in $TASKS; do [[ -f $RESULTS/$model/$task/eval_failpatch.json ]] || need_eval=1; done
-    (( need_eval )) && start_server "$RESULTS/$model/reb/reb.pt"
+    for task in $TASKS; do [[ -f $RESULTS/$model/$task/eval_failpatch_$VARIANT.json ]] || need_eval=1; done
+    (( need_eval )) && start_server "$RESULTS/$model/reb_$VARIANT/reb.pt"
     for task in $TASKS; do
         out="$RESULTS/$model/$task"
         common=(--model "$model" --task "$task" --port "$PORT" --split "$SPLIT" --n-envs "$N_ENVS" --seed "$SEED" --out-dir "$out")
-        if [[ ! -f $out/eval_failpatch.json ]]; then
-            stage "$out" failpatch_eval "$PY" -u -m failpatch.eval "${common[@]}" --episodes "$EVAL_EPISODES"
+        if [[ ! -f $out/eval_failpatch_$VARIANT.json ]]; then
+            stage "$out" "failpatch_eval_$VARIANT" "$PY" -u -m failpatch.eval "${common[@]}" --episodes "$EVAL_EPISODES" \
+                --tag "failpatch_$VARIANT"
         fi
     done
     finish_model
 done
 
-if ls "$RESULTS"/*/reb/train_summary.json >/dev/null 2>&1; then
+if ls "$RESULTS"/*/reb_*/train_summary.json >/dev/null 2>&1; then
     "$PY" scripts/summarize.py "$RESULTS"
 fi

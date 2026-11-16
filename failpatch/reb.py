@@ -97,7 +97,8 @@ def preserve_loss(reb, h, scale: float = 1.0):
     return (-log_p[:, 0] + (log_p[:, 1:].exp() * energy).sum(dim=1)).mean()
 
 
-def redirect_trust_loss(reb, h, proto, lambda_u, temperature, null_margin, lambda_r, margin_r, scale: float = 1.0):
+def redirect_trust_loss(reb, h, proto, lambda_u, temperature, null_margin, lambda_r, margin_r, scale: float = 1.0,
+                        bootstrap: bool = False):
     """Failure-associated states H-: route to experts that move the representation toward the
     local success prototype (eqs. 11-13) with bounded intervention (eq. 14).
 
@@ -112,11 +113,29 @@ def redirect_trust_loss(reb, h, proto, lambda_u, temperature, null_margin, lambd
         q = torch.cat([q0[:, None], (1 - q0)[:, None] * F.softmax(utility / temperature, dim=1)], dim=1)
     log_p = reb.log_probs(h)
     route_ce = -(q * log_p).sum(dim=1)
-    hinge = (q[:, 1:] * F.relu(margin_r - progress)).sum(dim=1)
+    # Paper: only experts already selected by the utility target (q_k > 0) are pushed towards the
+    # prototype. If no expert ever clears the Null threshold, that push never starts; `bootstrap`
+    # weights the push by the experts' relative utilities regardless of the Null gate.
+    push = F.softmax(utility / temperature, dim=1) if bootstrap else q[:, 1:]
+    hinge = (push * F.relu(margin_r - progress)).sum(dim=1)
     loss_redirect = (route_ce + lambda_r * hinge).mean()
     loss_trust = (q[:, 1:] * energy).sum(dim=1).mean()
-    stats = dict(redirect_null_target=float(q0.mean()), progress_best=float(progress.detach().max(dim=1).values.mean()))
+    stats = dict(redirect_null_target=float(q0.mean()), progress_best=float(progress.detach().max(dim=1).values.mean()),
+                 energy_best=float(energy.detach().gather(1, progress.detach().argmax(dim=1, keepdim=True)).mean()))
     return loss_redirect, loss_trust, stats
+
+
+@torch.no_grad()
+def prototype_distance_gap(minus: torch.Tensor, pool: torch.Tensor, k_nn: int = 20) -> tuple[float, float]:
+    """(mean distance of failure-associated representations to their local success prototype,
+    mean distance of reliable-success representations to theirs, the query itself excluded).
+    The difference is how far failures sit outside the success region, i.e. the largest progress
+    a patch can meaningfully make."""
+    pool_n = F.normalize(pool.float(), dim=-1)
+    d_minus = (F.normalize(minus.float(), dim=-1) - local_success_prototypes(minus, pool, k_nn)).norm(dim=-1).mean()
+    idx = torch.cdist(pool_n, pool_n).topk(min(k_nn + 1, len(pool_n)), largest=False).indices[:, 1:]
+    d_pool = (pool_n - pool_n[idx].median(dim=1).values).norm(dim=-1).mean()
+    return float(d_minus), float(d_pool)
 
 
 @torch.no_grad()

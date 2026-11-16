@@ -24,7 +24,7 @@ import torch
 
 from failpatch.adapters import build
 from failpatch.reb import (ResidualExpertBank, demo_loss, local_success_prototypes, preserve_loss,
-                           redirect_trust_loss)
+                           prototype_distance_gap, redirect_trust_loss)
 
 
 def load_buffer(task_dir: Path):
@@ -74,6 +74,12 @@ def main():
     parser.add_argument("--null-margin", type=float, default=0.1)
     parser.add_argument("--redirect-margin-weight", type=float, default=0.01)
     parser.add_argument("--redirect-margin", type=float, default=0.1)
+    parser.add_argument("--margins", default="paper", choices=("paper", "relative"),
+                        help="paper: --null-margin / --redirect-margin as given (0.1). relative: both are set to "
+                             "--margin-fraction of the measured gap between failure and success representations")
+    parser.add_argument("--margin-fraction", type=float, default=0.5)
+    parser.add_argument("--redirect-bootstrap", action="store_true",
+                        help="push experts towards the success prototype before any of them clears the Null threshold")
     parser.add_argument("--energy-scale", default="auto",
                         help="norm that residual energies ||delta h||^2 are measured against; 'auto' = mean norm of "
                              "the cached action hidden representations, '1' = raw energies as written in the paper")
@@ -121,7 +127,7 @@ def main():
 
     # ---- deployment buffer: H+, H- and local success prototypes -------------------------
     tic = time.time()
-    plus, minus, protos, buffer_stats = {}, {}, {}, {}
+    plus, minus, protos, buffer_stats, gaps = {}, {}, {}, {}, {}
     if not args.demo_only:
         for task in args.tasks:
             pool, h_plus, h_minus = load_buffer(Path(args.results) / task)
@@ -135,7 +141,18 @@ def main():
                 proto = torch.stack([local_success_prototypes(h_minus[:, s].to(device), pool[:, s].to(device), args.k_nn).cpu()
                                      for s in range(steps)], dim=1)
                 minus[task], protos[task] = h_minus.flatten(0, 1), proto.flatten(0, 1)
+                gaps[task] = [prototype_distance_gap(h_minus[:, s].to(device), pool[:, s].to(device), args.k_nn)
+                              for s in range(steps)]
         print(f"[train] deployment buffer chunks: {buffer_stats}", flush=True)
+    geometry = {}
+    if gaps:
+        d_fail = float(np.mean([g[0] for task in gaps for g in gaps[task]]))
+        d_succ = float(np.mean([g[1] for task in gaps for g in gaps[task]]))
+        geometry = dict(dist_fail_to_prototype=d_fail, dist_success_to_prototype=d_succ, gap=d_fail - d_succ)
+        if args.margins == "relative":
+            args.null_margin = args.redirect_margin = max(1e-4, args.margin_fraction * (d_fail - d_succ))
+        print(f"[train] prototype distances: failure {d_fail:.3f}, success {d_succ:.3f}, gap {d_fail - d_succ:.3f} -> "
+              f"null margin {args.null_margin:.4f}, redirect margin {args.redirect_margin:.4f} ({args.margins})", flush=True)
     prototype_s = time.time() - tic
 
     # ---- stage 2: optimise the REB --------------------------------------------------------
@@ -199,7 +216,8 @@ def main():
         if minus_store:
             h, proto = sample(minus_store, args.batch_size)
             l_r, l_t, extra = redirect_trust_loss(reb, h, proto, args.lambda_u, args.fail_temperature,
-                                                  args.null_margin, args.redirect_margin_weight, args.redirect_margin, scale)
+                                                  args.null_margin, args.redirect_margin_weight, args.redirect_margin, scale,
+                                                  bootstrap=args.redirect_bootstrap)
             loss = loss + args.lambda_r * l_r + args.lambda_t * l_t
             stats.update(redirect=float(l_r), trust=float(l_t), **extra)
         for group in opt.param_groups:
@@ -226,7 +244,9 @@ def main():
         feature_extraction_s=feature_s, prototype_s=prototype_s, optimization_s=optimization_s,
         model_load_s=load_s, steps=args.steps, demo_draws=n_draws,
         trainable_params=n_params, trainable_fraction=n_params / vla_params,
-        buffer_chunks=buffer_stats, energy_scale=scale, peak_gpu_memory_mib=torch.cuda.max_memory_allocated() / 2**20,
+        buffer_chunks=buffer_stats, energy_scale=scale, geometry=geometry,
+        margins=args.margins, null_margin=args.null_margin, redirect_margin=args.redirect_margin,
+        redirect_bootstrap=args.redirect_bootstrap, peak_gpu_memory_mib=torch.cuda.max_memory_allocated() / 2**20,
         final=stats,
     )
     (out / "train_summary.json").write_text(json.dumps(summary, indent=2))
