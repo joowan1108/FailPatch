@@ -35,6 +35,8 @@ VLA 는 전부 얼리고, 액션 헤드 직전에 **Null-gated Residual Expert B
 | 접촉 시트 | 청크당 1장, 최대 24청크 | 에피소드가 길어 균등 간격 24장 | RoboCasa 에피소드는 수십~수백 청크 |
 | 주석 VLM | GPT-5.5 | `OPENAI_API_KEY` 가 있으면 GPT-5.5, `ANTHROPIC_API_KEY` 가 있으면 Claude Opus 5.5 (effort medium), 둘 다 없으면 VLM 없이 휴리스틱(실패 롤아웃의 뒤 50%) | 키가 없어도 돌아가게 함. 어떤 방식이 쓰였는지 결과 표에 기록 |
 | 보정 크기 ‖Δh‖² 의 단위 | 은닉 표현 그대로 | 은닉 표현의 평균 크기로 나눈 값 (`--energy-scale auto`) | XR-1 의 은닉 표현 크기는 약 65 라서, 논문 값(λ_u, m)을 그대로 쓰면 Redirect 가 항상 \"보정 안 함\"만 고르게 됨 (실제로 확인). `--energy-scale 1` 이 논문 그대로 |
+| Redirect 문턱값 (m, m_r) | 0.1 고정 | `VARIANT=adapted`: 실패·성공 표현 사이 거리 차이의 절반 | XR-1 에서 실패 표현은 성공 프로토타입에서 0.26, 성공 표현은 0.19 떨어져 있어 줄일 수 있는 거리가 0.07 뿐. 0.1 은 도달 불가 |
+| Redirect 의 당기는 신호 | 문턱을 넘은 전문가에게만, 가중치 0.01 | `VARIANT=adapted`: 처음부터 모든 전문가에게, 가중치 1.0 | 논문 방식으로는 어떤 전문가도 문턱을 넘지 못해 신호가 시작되지 않음. 실제 버퍼로 확인: 논문 설정은 실패 구간 개입 0%, 수정 설정은 실패 구간 17% / 정상 구간 1% |
 | 클래스 균형 CE | 식 없음 | 경로별 타깃 질량의 역수로 가중 | 논문에 정의가 없어 해석 |
 
 ## 측정 항목
@@ -65,7 +67,8 @@ MODELS=xr1 TASKS=CoffeeSetupMug EVAL_EPISODES=4 N_SUCCESS=3 N_FAIL=3 MAX_EPISODE
   EXTRA_TRAIN_ARGS="--steps 600 --warmup-steps 100 --draws 4" RESULTS=/workspace/failpatch_smoke bash scripts/run_all.sh
 
 # 전체 실험 (결과: /workspace/failpatch_results)
-bash scripts/run_all.sh
+bash scripts/run_all.sh                  # VARIANT=adapted (기본)
+VARIANT=paper bash scripts/run_all.sh    # 논문 값 그대로. 같은 버퍼를 다시 쓰고 학습·평가만 추가
 
 # GPU 두 장이면 모델별로 나눠서
 GPU=0 PORT=10086 MODELS=xr1  bash scripts/run_all.sh

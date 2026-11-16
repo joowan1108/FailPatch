@@ -3,7 +3,7 @@
 #   1) base evaluation            -> <model>/<task>/eval_base.json
 #   2) deployment buffer          -> <model>/<task>/buffer/        (base-policy rollouts)
 #   3) offline annotation         -> <model>/<task>/labels.json
-#   4) FailPatch training (SFT)   -> <model>/reb/reb.pt, train_summary.json
+#   4) FailPatch training (SFT)   -> <model>/reb_<variant>/reb.pt, train_summary.json
 #   5) FailPatch evaluation       -> <model>/<task>/eval_failpatch_$VARIANT.json
 # Finished stages are skipped, so the script can be re-run after an interruption.
 #

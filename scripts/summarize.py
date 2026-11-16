@@ -56,51 +56,62 @@ def main():
     root = Path(sys.argv[1] if len(sys.argv) > 1 else "results")
     gpu_file = root / "gpu.txt"
     gpu = gpu_file.read_text().strip().splitlines()[0].split(",")[0].strip() if gpu_file.exists() else "?"
-    models = sorted(p for p in root.iterdir() if p.is_dir() and (p / "reb").exists())
+    models = sorted(p for p in root.iterdir() if p.is_dir() and any(p.glob("reb_*")))
 
-    header = ["model", "task", "base SR %", "FailPatch SR %", "patched chunks %", "buffer success/fail",
-              "annotator", "collect (h)", "base+FailPatch eval (h)"]
+    header = ["model", "task", "variant", "base SR %", "FailPatch SR %", "patched chunks %", "buffer success/fail",
+              "annotator", "collect (h)"]
     rows = []
     for model_dir in models:
-        for task_dir in sorted(p for p in model_dir.iterdir() if p.is_dir() and p.name != "reb"):
-            base, fp = load(task_dir / "eval_base.json"), load(task_dir / "eval_failpatch.json")
+        for task_dir in sorted(p for p in model_dir.iterdir() if p.is_dir() and not p.name.startswith("reb_")):
+            base = load(task_dir / "eval_base.json")
             meta, labels = load(task_dir / "buffer_meta.json") or {}, load(task_dir / "labels.json") or {}
             times = tsv(task_dir / "stage_times.tsv")
             first = next(iter(labels.values()), {})
             backend = first.get("annotator_model") or first.get("backend", "-")
-            rows.append([
-                model_dir.name, task_dir.name, pct(base), pct(fp),
-                num(None if fp is None else 100 * fp["mean_patched_fraction"], "{:.1f}"),
-                f"{meta.get('n_success', '-')}/{meta.get('n_fail', '-')}", backend,
-                num(times.get("collect", 0) / 3600 if "collect" in times else None, "{:.2f}"),
-                num((times.get("base_eval", 0) + times.get("failpatch_eval", 0)) / 3600 if times else None, "{:.2f}"),
-            ])
+            evals = sorted(task_dir.glob("eval_failpatch_*.json")) or [None]
+            for path in evals:
+                fp = load(path) if path else None
+                rows.append([
+                    model_dir.name, task_dir.name, path.stem.replace("eval_failpatch_", "") if path else "-",
+                    pct(base), pct(fp), num(None if fp is None else 100 * fp["mean_patched_fraction"], "{:.1f}"),
+                    f"{meta.get('n_success', '-')}/{meta.get('n_fail', '-')}", backend,
+                    num(times.get("collect", 0) / 3600 if "collect" in times else None, "{:.2f}"),
+                ])
     table(header, rows)
 
-    sft_header = ["model", "GPU", "SFT time (s)", "feature extraction (s)", "optimisation (s)", "trainable params",
-                  "GPU hours whole pipeline (h)", "GPU hours of SFT (h)", "mean GPU util (%)", "peak GPU memory (MiB)"]
+    sft_header = ["model", "variant", "GPU", "SFT time (s)", "feature extraction (s)", "optimisation (s)",
+                  "trainable params", "GPU hours of SFT (h)", "peak GPU memory in SFT (MiB)"]
     sft_rows = []
     for model_dir in models:
-        train = load(model_dir / "reb" / "train_summary.json") or {}
-        wall = sum(tsv(model_dir / "model_wall_time.tsv").values()) / 3600
-        util, peak = gpu_stats(model_dir / "gpu_usage.csv")
-        sft = train.get("sft_time_s")
-        sft_rows.append([
-            model_dir.name, f"1x {train.get('gpu', gpu)}", num(sft), num(train.get("feature_extraction_s")),
-            num(train.get("optimization_s")),
-            "-" if not train else f"{train['trainable_params'] / 1e6:.1f}M ({100 * train['trainable_fraction']:.2f}%)",
-            f"{wall:.2f}", num(None if sft is None else sft / 3600, "{:.2f}"), num(util), num(peak),
-        ])
+        for reb_dir in sorted(model_dir.glob("reb_*")):
+            train = load(reb_dir / "train_summary.json")
+            if not train:
+                continue
+            sft = train["sft_time_s"]
+            sft_rows.append([
+                model_dir.name, reb_dir.name[4:], f"1x {train.get('gpu', gpu)}", num(sft),
+                num(train["feature_extraction_s"]), num(train["optimization_s"]),
+                f"{train['trainable_params'] / 1e6:.1f}M ({100 * train['trainable_fraction']:.2f}%)",
+                num(sft / 3600, "{:.2f}"), num(train.get("peak_gpu_memory_mib")),
+            ])
     print()
     table(sft_header, sft_rows)
     for row in sft_rows:
-        if row[2] != "-":
-            print(f"\n{row[0]}: SFT took {row[2]} s = {row[7]} h on {row[1]}; whole pipeline {row[6]} h on the same GPU")
+        print(f"\n{row[0]} ({row[1]}): SFT took {row[3]} s = {row[7]} h on {row[2]}")
+
+    gpu_header = ["model", "GPU", "GPU hours whole pipeline (h)", "mean GPU util (%)", "peak GPU memory (MiB)"]
+    gpu_rows = []
+    for model_dir in models:
+        wall = sum(tsv(model_dir / "model_wall_time.tsv").values()) / 3600
+        util, peak = gpu_stats(model_dir / "gpu_usage.csv")
+        gpu_rows.append([model_dir.name, f"1x {gpu}", f"{wall:.2f}", num(util), num(peak)])
+    print()
+    table(gpu_header, gpu_rows)
 
     with (root / "summary.csv").open("w", newline="") as f:
         csv.writer(f).writerows([header] + rows)
     with (root / "gpu_summary.csv").open("w", newline="") as f:
-        csv.writer(f).writerows([sft_header] + sft_rows)
+        csv.writer(f).writerows([sft_header] + sft_rows + [[]] + [gpu_header] + gpu_rows)
     print(f"\nwrote {root / 'summary.csv'} and {root / 'gpu_summary.csv'}")
 
 
