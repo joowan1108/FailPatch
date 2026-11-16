@@ -25,6 +25,8 @@ N_FAIL="${N_FAIL:-50}"
 MAX_EPISODES="${MAX_EPISODES:-300}"
 NUM_DEMOS="${NUM_DEMOS:-50}"
 DEMO_SAMPLES="${DEMO_SAMPLES:-1000}"
+# auto | openai | anthropic | heuristic | external (annotate on another machine so that the API key
+# never touches this instance; see scripts/annotate_local.sh)
 ANNOTATOR="${ANNOTATOR:-auto}"
 PORT="${PORT:-10086}"
 EXTRA_TRAIN_ARGS="${EXTRA_TRAIN_ARGS:-}"
@@ -105,6 +107,7 @@ for model in $MODELS; do
 
     # 1-3: base evaluation, deployment buffer, annotation
     need_base=0
+    pending_labels=0
     for task in $TASKS; do
         [[ -f $RESULTS/$model/$task/eval_base.json && -f $RESULTS/$model/$task/buffer_meta.json ]] || need_base=1
     done
@@ -120,11 +123,21 @@ for model in $MODELS; do
                 --n-success "$N_SUCCESS" --n-fail "$N_FAIL" --max-episodes "$MAX_EPISODES"
         fi
         if [[ ! -f $out/annotate.done ]]; then
-            stage "$out" annotate "$PY" -u -m failpatch.annotate --out-dir "$out" --annotator "$ANNOTATOR"
-            touch "$out/annotate.done"
+            if [[ $ANNOTATOR == external ]]; then
+                pending_labels=1   # labels are produced elsewhere (scripts/annotate_local.sh)
+            else
+                stage "$out" annotate "$PY" -u -m failpatch.annotate --out-dir "$out" --annotator "$ANNOTATOR"
+                touch "$out/annotate.done"
+            fi
         fi
     done
     stop_server   # free the GPU memory for training
+    if (( pending_labels )); then
+        echo "[run] $model: deployment buffers are ready; waiting for labels."
+        echo "      On the machine that holds the API key run scripts/annotate_local.sh, then re-run this script."
+        finish_model
+        continue
+    fi
 
     # 4: FailPatch training (all tasks jointly)
     if [[ ! -f $RESULTS/$model/reb/reb.pt ]]; then
@@ -147,4 +160,6 @@ for model in $MODELS; do
     finish_model
 done
 
-"$PY" scripts/summarize.py "$RESULTS"
+if ls "$RESULTS"/*/reb/train_summary.json >/dev/null 2>&1; then
+    "$PY" scripts/summarize.py "$RESULTS"
+fi
