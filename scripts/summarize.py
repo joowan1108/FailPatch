@@ -66,7 +66,8 @@ def main():
             base, fp = load(task_dir / "eval_base.json"), load(task_dir / "eval_failpatch.json")
             meta, labels = load(task_dir / "buffer_meta.json") or {}, load(task_dir / "labels.json") or {}
             times = tsv(task_dir / "stage_times.tsv")
-            backend = next(iter(labels.values()), {}).get("backend", "-")
+            first = next(iter(labels.values()), {})
+            backend = first.get("annotator_model") or first.get("backend", "-")
             rows.append([
                 model_dir.name, task_dir.name, pct(base), pct(fp),
                 num(None if fp is None else 100 * fp["mean_patched_fraction"], "{:.1f}"),

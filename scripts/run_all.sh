@@ -29,6 +29,11 @@ ANNOTATOR="${ANNOTATOR:-auto}"
 PORT="${PORT:-10086}"
 EXTRA_TRAIN_ARGS="${EXTRA_TRAIN_ARGS:-}"
 
+# API key for the offline annotator: keep it out of templates and shell history by putting
+#   export ANTHROPIC_API_KEY=...   (or OPENAI_API_KEY=...)
+# into $WORK/.api_env (chmod 600). Without a key the heuristic annotator is used.
+if [[ -f $WORK/.api_env ]]; then source "$WORK/.api_env"; fi
+
 export CUDA_VISIBLE_DEVICES="$GPU" MUJOCO_EGL_DEVICE_ID="$GPU"
 export PYTHONPATH="$PROJECT${PYTHONPATH:+:$PYTHONPATH}" NO_ALBUMENTATIONS_UPDATE=1
 PY="$VENVS/sim/bin/python"

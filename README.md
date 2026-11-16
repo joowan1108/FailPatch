@@ -33,7 +33,7 @@ VLA 는 전부 얼리고, 액션 헤드 직전에 **Null-gated Residual Expert B
 | 시연 분기의 VLA 순전파 | 학습 루프 안에서 매 스텝 | 학습 전에 한 번 추출해 저장 (샘플당 노이즈·시간 16쌍) | VLA 가 전부 얼어 있어 같은 목적함수이고 비용이 훨씬 작음. 이미지 증강은 없음 |
 | 디노이징 스텝 | 명시 없음 | 각 스텝(XR-1 5회, RLDX-1 4회)마다 라우팅, 프로토타입도 같은 스텝끼리 검색 | 두 모델 모두 스텝마다 액션 투영을 호출 |
 | 접촉 시트 | 청크당 1장, 최대 24청크 | 에피소드가 길어 균등 간격 24장 | RoboCasa 에피소드는 수십~수백 청크 |
-| 주석 VLM | GPT-5.5 | `OPENAI_API_KEY` 가 있으면 GPT-5.5, `ANTHROPIC_API_KEY` 가 있으면 Claude, 둘 다 없으면 VLM 없이 휴리스틱(실패 롤아웃의 뒤 50%) | 키가 없어도 돌아가게 함. 어떤 방식이 쓰였는지 결과 표에 기록 |
+| 주석 VLM | GPT-5.5 | `OPENAI_API_KEY` 가 있으면 GPT-5.5, `ANTHROPIC_API_KEY` 가 있으면 Claude Opus 5.5 (effort medium), 둘 다 없으면 VLM 없이 휴리스틱(실패 롤아웃의 뒤 50%) | 키가 없어도 돌아가게 함. 어떤 방식이 쓰였는지 결과 표에 기록 |
 | 클래스 균형 CE | 식 없음 | 경로별 타깃 질량의 역수로 가중 | 논문에 정의가 없어 해석 |
 
 ## 측정 항목
@@ -56,7 +56,8 @@ Docker 이미지는 DSRL 실험과 같은 `joowan1108/dsrl-robocasa365:v1` 을 �
 ```bash
 cd /workspace/FailPatch && tmux new -s failpatch
 bash setup/check.sh
-export OPENAI_API_KEY=...        # 또는 ANTHROPIC_API_KEY; 없으면 휴리스틱 주석
+# 주석용 키 (없으면 휴리스틱 주석). 파일로 두면 run_all.sh 가 읽습니다.
+echo 'export ANTHROPIC_API_KEY=...' > /workspace/.api_env && chmod 600 /workspace/.api_env
 
 # 짧은 확인 (모델 하나, 태스크 하나)
 MODELS=xr1 TASKS=CoffeeSetupMug EVAL_EPISODES=4 N_SUCCESS=3 N_FAIL=3 MAX_EPISODES=16 DEMO_SAMPLES=64 \

@@ -5,7 +5,8 @@ reliable success. Writes <out-dir>/labels.json.
 
 Backends (--annotator):
   openai     GPT via the OpenAI API (the paper uses GPT-5.5); needs OPENAI_API_KEY
-  anthropic  Claude via the Anthropic API; needs ANTHROPIC_API_KEY
+  anthropic  Claude via the Anthropic API; needs ANTHROPIC_API_KEY. Model and reasoning effort:
+             ANTHROPIC_MODEL (default claude-opus-5-5), ANTHROPIC_EFFORT (default medium)
   heuristic  no VLM: every successful rollout is reliable and the last `--heuristic-fraction`
              of a failed rollout is failure-associated
   auto       openai if OPENAI_API_KEY is set, else anthropic if ANTHROPIC_API_KEY is set,
@@ -99,15 +100,22 @@ def ask_openai(image: bytes, prompt: str, model: str) -> str:
     return out["choices"][0]["message"]["content"]
 
 
-def ask_anthropic(image: bytes, prompt: str, model: str) -> str:
+def ask_anthropic(image: bytes, prompt: str, model: str, effort: str) -> str:
+    """Claude Messages API. Raw HTTPS instead of the `anthropic` SDK because the simulator
+    environment of the Docker image does not ship the SDK and this is its only API call.
+    Claude Opus 5.5 always thinks (adaptive); depth is set with output_config.effort, and
+    max_tokens has to leave room for the thinking plus the short JSON answer."""
     out = _post("https://api.anthropic.com/v1/messages",
                 {"x-api-key": os.environ["ANTHROPIC_API_KEY"], "anthropic-version": "2023-06-01"},
-                {"model": model, "max_tokens": 1024, "system": SYSTEM_PROMPT, "messages": [
-                    {"role": "user", "content": [
-                        {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg",
-                                                     "data": base64.b64encode(image).decode()}},
-                        {"type": "text", "text": prompt}]}]})
-    return "".join(block.get("text", "") for block in out["content"])
+                {"model": model, "max_tokens": 16000, "system": SYSTEM_PROMPT,
+                 "output_config": {"effort": effort},
+                 "messages": [{"role": "user", "content": [
+                     {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg",
+                                                  "data": base64.b64encode(image).decode()}},
+                     {"type": "text", "text": prompt}]}]})
+    if out.get("stop_reason") == "refusal":
+        raise RuntimeError(f"request declined ({(out.get('stop_details') or {}).get('category')})")
+    return "".join(block["text"] for block in out["content"] if block.get("type") == "text")
 
 
 def parse_json(text: str) -> dict:
@@ -121,6 +129,8 @@ def main():
     parser.add_argument("--annotator", default="auto", choices=("auto", "openai", "anthropic", "heuristic"))
     parser.add_argument("--openai-model", default=os.environ.get("OPENAI_MODEL", "gpt-5.5"))
     parser.add_argument("--anthropic-model", default=os.environ.get("ANTHROPIC_MODEL", "claude-opus-5-5"))
+    parser.add_argument("--anthropic-effort", default=os.environ.get("ANTHROPIC_EFFORT", "medium"),
+                        choices=("low", "medium", "high", "xhigh", "max"))
     parser.add_argument("--heuristic-fraction", type=float, default=0.5)
     args = parser.parse_args()
 
@@ -140,7 +150,8 @@ def main():
         ep = np.load(path, allow_pickle=False)
         success, chunks = bool(ep["success"]), int(ep["hidden"].shape[0])
         fallback_onset = int(math.floor(chunks * (1 - args.heuristic_fraction)))
-        entry = dict(success=success, chunks=chunks, backend=backend, source=backend,
+        model_name = {"openai": args.openai_model, "anthropic": f"{args.anthropic_model} (effort {args.anthropic_effort})"}.get(backend)
+        entry = dict(success=success, chunks=chunks, backend=backend, source=backend, annotator_model=model_name,
                      failure_onset_chunk=None if success else fallback_onset,
                      reliable_success=True if success else None)
         if backend != "heuristic":
@@ -150,7 +161,7 @@ def main():
             sheet = contact_sheet(ep["thumbs"], ep["thumb_idx"])
             try:
                 text = (ask_openai(sheet, prompt, args.openai_model) if backend == "openai"
-                        else ask_anthropic(sheet, prompt, args.anthropic_model))
+                        else ask_anthropic(sheet, prompt, args.anthropic_model, args.anthropic_effort))
                 answer = parse_json(text)
                 entry.update(confidence=answer.get("confidence"), failure_type=answer.get("failure_type"),
                              notes=answer.get("notes"))
