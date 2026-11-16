@@ -107,7 +107,8 @@ class XR1Adapter:
         self.act_mean, self.act_std = cfg["mean"][0].float(), cfg["std"][0].float()  # (H, D)
         self.frame_deltas = [-(obs_history - 1 - i) * obs_interval for i in range(obs_history)]
         self.exec_steps = exec_steps
-        self.hidden_dim = int(self.model.action_output_layer.in_features)
+        # action_output_layer is an MLPProjector (the frozen action projection W_v of the paper)
+        self.hidden_dim = int(self.model.action_output_layer.input_dim)
         self.hook = HiddenHook(self.model.action_output_layer, self.horizon)
         self._demo = None  # set while extracting demo features
 
@@ -149,7 +150,7 @@ class XR1Adapter:
 
     def project(self, z: torch.Tensor) -> torch.Tensor:
         layer = self.model.action_output_layer
-        return layer(z.to(layer.weight.dtype)).float()
+        return layer(z.to(next(layer.parameters()).dtype)).float()
 
     @torch.no_grad()
     def _demo_forward(self, data: dict, actions: np.ndarray, draws: int):
@@ -223,7 +224,7 @@ class RLDXAdapter:
         self.horizon, self.action_width = int(am.config.action_horizon), int(am.action_dim)
         self.exec_steps = exec_steps
         self.hook = HiddenHook(am.action_decoder, self.horizon)
-        self.hidden_dim = int(self.model.config.diffusion_model_cfg["output_dim"])
+        self.hidden_dim = int(am.hidden_size)  # input width of the embodiment-specific action decoder
         self.use_memory = bool(self.policy.use_memory)
         self._embodiment_id = None
 
@@ -274,7 +275,8 @@ class RLDXAdapter:
         collated = _rec_to_dtype(self.policy.collate_fn([processed]), dtype=torch.bfloat16)
         zs, targets = [], []
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            backbone_inputs, action_inputs = self.model.prepare_input(dict(collated))
+            # the collator wraps the batch as {"inputs": ...} (PolicyRuntime calls get_action(**collated))
+            backbone_inputs, action_inputs = self.model.prepare_input(dict(collated["inputs"]))
             backbone_outputs = self.model.backbone(backbone_inputs)
             self._embodiment_id = action_inputs.embodiment_id
             clean = action_inputs.action.float().cpu()[0]
