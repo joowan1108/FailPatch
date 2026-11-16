@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import time
 from pathlib import Path
 
@@ -57,7 +58,9 @@ def main():
     parser.add_argument("--steps", type=int, default=30_000)
     parser.add_argument("--warmup-steps", type=int, default=5_000, help="Null-disabled warm-up")
     parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--lr", type=float, default=2.5e-5)
+    parser.add_argument("--lr", type=float, default=2.5e-5, help="peak learning rate")
+    parser.add_argument("--lr-warmup-steps", type=int, default=1000)
+    parser.add_argument("--lr-final", type=float, default=2.5e-6)
     parser.add_argument("--weight-decay", type=float, default=1e-10)
     parser.add_argument("--n-experts", type=int, default=8)
     parser.add_argument("--bottleneck", type=int, default=704)
@@ -136,6 +139,15 @@ def main():
     reb = ResidualExpertBank(adapter.hidden_dim, args.n_experts, args.bottleneck).to(device)
     n_params = sum(p.numel() for p in reb.parameters())
     opt = torch.optim.AdamW(reb.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+
+    def learning_rate(step: int) -> float:
+        """Linear warm-up to the peak, then cosine decay. The paper only states the peak value
+        (2.5e-5); warm-up length and final value are the OpenPI defaults its code base uses."""
+        if step <= args.lr_warmup_steps:
+            return args.lr * step / max(1, args.lr_warmup_steps)
+        progress = (step - args.lr_warmup_steps) / max(1, args.steps - args.lr_warmup_steps)
+        return args.lr_final + 0.5 * (args.lr - args.lr_final) * (1 + math.cos(math.pi * progress))
+
     for p in adapter.model.parameters():
         p.requires_grad_(False)
 
@@ -174,6 +186,8 @@ def main():
                                                   args.null_margin, args.redirect_margin_weight, args.redirect_margin)
             loss = loss + args.lambda_r * l_r + args.lambda_t * l_t
             stats.update(redirect=float(l_r), trust=float(l_t), **extra)
+        for group in opt.param_groups:
+            group["lr"] = learning_rate(step)
         opt.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(reb.parameters(), 1.0)
