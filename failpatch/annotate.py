@@ -11,8 +11,10 @@ Backends (--annotator):
              of a failed rollout is failure-associated
   auto       openai if OPENAI_API_KEY is set, else anthropic if ANTHROPIC_API_KEY is set,
              else heuristic
-The prompts are the ones printed in the paper; only the sentence describing the chunk length is
-adapted, because our rollouts are longer than 24 chunks and the contact sheet is subsampled.
+The prompts are the ones printed in the paper; only the sentence describing the contact sheet is
+adapted, because our rollouts are longer than 24 chunks: frames are stored at native resolution
+for up to 96 evenly spaced chunks and sent as one or two 8x6 sheets of 256 px tiles (<= 2048x1536,
+inside the 2576 px limit, so Claude sees them without downscaling).
 """
 
 from __future__ import annotations
@@ -36,7 +38,7 @@ Respond only with valid JSON matching the requested schema. If uncertain, return
 
 USER_PROMPT = """Task instruction: {task_instruction}
 Rollout outcome: {rollout_outcome}
-You are given a temporally ordered contact sheet of RGB frames from a single deployment rollout. Each tile is labeled with its chunk index t in execution order. The rollout has {num_chunks} action chunks (indices 0..{last_chunk}); the tiles show an evenly spaced subset of them (left agent-view camera).
+You are given {sheets} of RGB frames from a single deployment rollout. Each tile is labeled with its chunk index t in execution order. The rollout has {num_chunks} action chunks (indices 0..{last_chunk}); the tiles show {coverage} (left agent-view camera).
 Definitions:
 failure_onset_chunk: for a failed rollout, the earliest chunk where a visible mistake or wrong commitment appears that will likely cause final task failure if not corrected.
 reliable_success: for a successful rollout, whether the trajectory contains no visually apparent substantive intermediate deviation that would make it unreliable as a success prototype (true = reliable, false = unreliable).
@@ -61,19 +63,34 @@ For a successful rollout, set failure_onset_chunk and failure_type to null.
 Return JSON only."""
 
 
-def contact_sheet(thumbs: np.ndarray, idx: np.ndarray, max_tiles: int = 24, tile: int = 224) -> bytes:
+def contact_sheets(thumbs: np.ndarray, idx: np.ndarray, max_tiles: int = 96, per_sheet: int = 48,
+                   cols: int = 8, tile: int = 256) -> list[bytes]:
+    """All stored frames (up to `max_tiles`, evenly spaced) on as few sheets of `per_sheet` tiles
+    as possible, split evenly. Frames are only resized when they are not `tile` pixels already."""
     keep = np.unique(np.linspace(0, len(idx) - 1, min(max_tiles, len(idx))).round().astype(int))
-    cols = 6
-    rows = math.ceil(len(keep) / cols)
-    sheet = np.zeros((rows * tile, cols * tile, 3), np.uint8)
-    for n, j in enumerate(keep):
-        img = cv2.resize(thumbs[j], (tile, tile), interpolation=cv2.INTER_CUBIC)[:, :, ::-1].copy()  # RGB -> BGR
-        cv2.rectangle(img, (0, 0), (92, 26), (0, 0, 0), -1)
-        cv2.putText(img, f"t={int(idx[j])}", (4, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        r, c = divmod(n, cols)
-        sheet[r * tile : (r + 1) * tile, c * tile : (c + 1) * tile] = img
-    ok, buf = cv2.imencode(".jpg", sheet, [cv2.IMWRITE_JPEG_QUALITY, 90])
-    return buf.tobytes()
+    sheets = []
+    for part in np.array_split(keep, math.ceil(len(keep) / per_sheet)):
+        rows = math.ceil(len(part) / cols)
+        sheet = np.zeros((rows * tile, min(cols, len(part)) * tile, 3), np.uint8)
+        for n, j in enumerate(part):
+            img = thumbs[j] if thumbs[j].shape[:2] == (tile, tile) else \
+                cv2.resize(thumbs[j], (tile, tile), interpolation=cv2.INTER_CUBIC)
+            img = img[:, :, ::-1].copy()  # RGB -> BGR
+            cv2.rectangle(img, (0, 0), (92, 26), (0, 0, 0), -1)
+            cv2.putText(img, f"t={int(idx[j])}", (4, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            r, c = divmod(n, cols)
+            sheet[r * tile : (r + 1) * tile, c * tile : (c + 1) * tile] = img
+        ok, buf = cv2.imencode(".jpg", sheet, [cv2.IMWRITE_JPEG_QUALITY, 95])
+        sheets.append(buf.tobytes())
+    return sheets
+
+
+def describe_sheets(n_sheets: int, n_tiles: int, num_chunks: int) -> tuple[str, str]:
+    sheets = ("a temporally ordered contact sheet" if n_sheets == 1 else
+              f"{n_sheets} temporally ordered contact sheets (each continues the previous one)")
+    coverage = ("every chunk" if n_tiles >= num_chunks else
+                f"an evenly spaced subset of {n_tiles} of them (about one every {num_chunks / n_tiles:.1f} chunks)")
+    return sheets, coverage
 
 
 def _post(url: str, headers: dict, body: dict) -> dict:
@@ -89,18 +106,18 @@ def _post(url: str, headers: dict, body: dict) -> dict:
             time.sleep(5 * (attempt + 1))
 
 
-def ask_openai(image: bytes, prompt: str, model: str) -> str:
-    data_url = "data:image/jpeg;base64," + base64.b64encode(image).decode()
+def ask_openai(images: list[bytes], prompt: str, model: str) -> str:
+    content = [{"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + base64.b64encode(im).decode()}}
+               for im in images]
     out = _post("https://api.openai.com/v1/chat/completions",
                 {"authorization": f"Bearer {os.environ['OPENAI_API_KEY']}"},
                 {"model": model, "messages": [
                     {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": [{"type": "image_url", "image_url": {"url": data_url}},
-                                                 {"type": "text", "text": prompt}]}]})
+                    {"role": "user", "content": content + [{"type": "text", "text": prompt}]}]})
     return out["choices"][0]["message"]["content"]
 
 
-def ask_anthropic(image: bytes, prompt: str, model: str, effort: str) -> str:
+def ask_anthropic(images: list[bytes], prompt: str, model: str, effort: str) -> str:
     """Claude Messages API. Raw HTTPS instead of the `anthropic` SDK because the simulator
     environment of the Docker image does not ship the SDK and this is its only API call.
     Claude Opus 5.5 always thinks (adaptive); depth is set with output_config.effort, and
@@ -111,8 +128,8 @@ def ask_anthropic(image: bytes, prompt: str, model: str, effort: str) -> str:
                  "output_config": {"effort": effort},
                  "messages": [{"role": "user", "content": [
                      {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg",
-                                                  "data": base64.b64encode(image).decode()}},
-                     {"type": "text", "text": prompt}]}]})
+                                                  "data": base64.b64encode(im).decode()}} for im in images
+                 ] + [{"type": "text", "text": prompt}]}]})
     if out.get("stop_reason") == "refusal":
         raise RuntimeError(f"request declined ({(out.get('stop_details') or {}).get('category')})")
     return "".join(block["text"] for block in out["content"] if block.get("type") == "text")
@@ -152,13 +169,17 @@ def main():
         fallback_onset = int(math.floor(chunks * (1 - args.heuristic_fraction)))
         model_name = {"openai": args.openai_model, "anthropic": f"{args.anthropic_model} (effort {args.anthropic_effort})"}.get(backend)
         entry = dict(success=success, chunks=chunks, backend=backend, source=backend, annotator_model=model_name,
+                     frames_shown=min(96, len(ep["thumb_idx"])), frame_px=int(ep["thumbs"].shape[1]),
                      failure_onset_chunk=None if success else fallback_onset,
                      reliable_success=True if success else None)
         if backend != "heuristic":
+            sheet = contact_sheets(ep["thumbs"], ep["thumb_idx"])
+            n_tiles = min(96, len(ep["thumb_idx"]))
+            sheets_text, coverage = describe_sheets(len(sheet), n_tiles, chunks)
             prompt = USER_PROMPT.format(task_instruction=str(ep["instruction"]),
                                         rollout_outcome="success" if success else "failure",
+                                        sheets=sheets_text, coverage=coverage,
                                         num_chunks=chunks, last_chunk=chunks - 1, exec_steps=meta["exec_steps"])
-            sheet = contact_sheet(ep["thumbs"], ep["thumb_idx"])
             try:
                 text = (ask_openai(sheet, prompt, args.openai_model) if backend == "openai"
                         else ask_anthropic(sheet, prompt, args.anthropic_model, args.anthropic_effort))

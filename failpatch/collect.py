@@ -3,7 +3,8 @@
 
 Per episode: <out-dir>/buffer/ep_<seed>.npz with
   hidden   (T, S, d) float16  action hidden representation per chunk and denoising step
-  thumbs   (n, 160, 160, 3)   left agent-view frames at `thumb_idx` (<= 48, evenly spaced chunks)
+  thumbs   (n, H, W, 3)       left agent-view frames at native camera resolution (256x256) at
+                              `thumb_idx`: every chunk, or `--max-frames` evenly spaced chunks
   success, steps, instruction
 """
 
@@ -14,7 +15,6 @@ import json
 import time
 from pathlib import Path
 
-import cv2
 import numpy as np
 
 from failpatch.rollout import add_common_args, connect, run_episodes
@@ -26,6 +26,7 @@ def main():
     parser.add_argument("--n-success", type=int, default=50)
     parser.add_argument("--n-fail", type=int, default=50)
     parser.add_argument("--max-episodes", type=int, default=300)
+    parser.add_argument("--max-frames", type=int, default=96, help="frames kept per episode for the annotator")
     args = parser.parse_args()
 
     out = Path(args.out_dir) / "buffer"
@@ -52,8 +53,8 @@ def main():
         key = ep["success"]
         if counts[key] < target[key]:  # surplus episodes of the already-full class are dropped
             counts[key] += 1
-            idx = np.unique(np.linspace(0, ep["chunks"] - 1, min(48, ep["chunks"])).round().astype(int))
-            thumbs = np.stack([cv2.resize(ep["frames"][i], (160, 160), interpolation=cv2.INTER_AREA) for i in idx])
+            idx = np.unique(np.linspace(0, ep["chunks"] - 1, min(args.max_frames, ep["chunks"])).round().astype(int))
+            thumbs = np.stack([ep["frames"][i] for i in idx])  # native resolution, no resizing
             np.savez_compressed(out / f"ep_{ep['seed']:07d}.npz", hidden=ep["hidden"], thumbs=thumbs,
                                 thumb_idx=idx, success=key, steps=ep["steps"], instruction=ep["instruction"])
         print(f"[collect] {args.model}/{args.task}: success {counts[True]}/{args.n_success}, "
