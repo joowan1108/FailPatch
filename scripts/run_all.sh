@@ -154,7 +154,8 @@ for model in $MODELS; do
     if [[ ! -f $RESULTS/$model/reb_$VARIANT/reb.pt ]]; then
         # shellcheck disable=SC2086
         stage "$RESULTS/$model/reb_$VARIANT" train "$MODEL_PY" -u -m failpatch.train --model "$model" "${MODEL_ARGS[@]}" \
-            --tasks $TASKS --results "$RESULTS/$model" --demos "$RESULTS/demos" --out "$RESULTS/$model/reb_$VARIANT" $VARIANT_ARGS $EXTRA_TRAIN_ARGS
+            --tasks $TASKS --results "$RESULTS/$model" --demos "$RESULTS/demos" --out "$RESULTS/$model/reb_$VARIANT" \
+            --feature-cache "$RESULTS/$model/features" $VARIANT_ARGS $EXTRA_TRAIN_ARGS
     fi
 
     # 5: evaluation with the REB attached

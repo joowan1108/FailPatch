@@ -55,6 +55,8 @@ def main():
     parser.add_argument("--demos", required=True, help="directory with demos_<task>.npz")
     parser.add_argument("--out", required=True)
     parser.add_argument("--draws", type=int, default=16)
+    parser.add_argument("--feature-cache", default=None,
+                        help="directory to store/reuse the frozen demonstration features across variants")
     parser.add_argument("--steps", type=int, default=30_000)
     parser.add_argument("--warmup-steps", type=int, default=5_000, help="Null-disabled warm-up")
     parser.add_argument("--batch-size", type=int, default=32)
@@ -101,7 +103,16 @@ def main():
     # ---- stage 1: frozen features of the demonstrations ---------------------------------
     tic = time.time()
     demo = {}
+    cache_dir = Path(args.feature_cache) if args.feature_cache else None
+    feature_cache_hits = 0
     for task in args.tasks:
+        cache_file = cache_dir / f"demo_features_{task}_draws{args.draws}.pt" if cache_dir else None
+        if cache_file is not None and cache_file.exists():
+            # The frozen features do not depend on the training variant, so variants share them.
+            demo[task] = torch.load(cache_file)
+            feature_cache_hits += 1
+            print(f"[train] features {task}: loaded from {cache_file}", flush=True)
+            continue
         data = np.load(Path(args.demos) / f"demos_{task}.npz")
         if list(data["frame_deltas"]) != list(adapter.frame_deltas):
             raise RuntimeError(f"demo frames {list(data['frame_deltas'])} != model frames {adapter.frame_deltas}")
@@ -121,6 +132,9 @@ def main():
             if i % 100 == 0:
                 print(f"[train] features {task}: {i}/{len(data['actions'])} ({time.time() - tic:.0f}s)", flush=True)
         demo[task] = (torch.cat(zs), torch.cat(targets), torch.cat(masks))
+        if cache_file is not None:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            torch.save(demo[task], cache_file)
     feature_s = time.time() - tic
     n_draws = sum(len(v[0]) for v in demo.values())
     print(f"[train] demo features: {n_draws} (sample, noise, time) draws in {feature_s:.0f}s", flush=True)
@@ -241,7 +255,7 @@ def main():
         model=args.model, tasks=args.tasks, demo_only=args.demo_only,
         gpu=torch.cuda.get_device_name(0),
         sft_time_s=feature_s + prototype_s + optimization_s,
-        feature_extraction_s=feature_s, prototype_s=prototype_s, optimization_s=optimization_s,
+        feature_extraction_s=feature_s, features_from_cache=feature_cache_hits, prototype_s=prototype_s, optimization_s=optimization_s,
         model_load_s=load_s, steps=args.steps, demo_draws=n_draws,
         trainable_params=n_params, trainable_fraction=n_params / vla_params,
         buffer_chunks=buffer_stats, energy_scale=scale, geometry=geometry,

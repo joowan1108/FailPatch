@@ -98,6 +98,8 @@ def main():
     table(sft_header, sft_rows)
     for row in sft_rows:
         print(f"\n{row[0]} ({row[1]}): SFT took {row[3]} s = {row[7]} h on {row[2]}")
+    print("\nNote: a variant trained after another one reuses its cached demonstration features, so its "
+          "'feature extraction' time is only the loading time; add the first variant's value for a from-scratch SFT time.")
 
     gpu_header = ["model", "GPU", "GPU hours whole pipeline (h)", "mean GPU util (%)", "peak GPU memory (MiB)"]
     gpu_rows = []
