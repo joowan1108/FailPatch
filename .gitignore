@@ -2,6 +2,7 @@ results*/
 __pycache__/
 *.pyc
 vastai.md
+HANDOFF.md
 
 # never commit credentials
 .api_env
