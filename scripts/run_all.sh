@@ -33,12 +33,15 @@ EXTRA_TRAIN_ARGS="${EXTRA_TRAIN_ARGS:-}"
 # VARIANT selects the training objective; each variant gets its own <model>/reb_<variant> directory
 # and eval_failpatch_<variant>.json, so several can be compared on the same buffers:
 #   paper    hyper-parameters exactly as in the paper (table 5)
+#   adapted_sum  like adapted, with the paper's summed action loss (adapted used the per-entry mean,
+#            which made the eight experts collapse onto one another)
 #   adapted  Redirect margins relative to the measured failure/success gap, experts pushed towards
 #            the success prototype from the start, and a stronger push (see README)
 VARIANT="${VARIANT:-adapted}"
 case "$VARIANT" in
-    paper)   VARIANT_ARGS="" ;;
-    adapted) VARIANT_ARGS="--margins relative --redirect-bootstrap --redirect-margin-weight 1.0" ;;
+    paper)       VARIANT_ARGS="--action-loss sum" ;;
+    adapted)     VARIANT_ARGS="--action-loss mean --margins relative --redirect-bootstrap --redirect-margin-weight 1.0" ;;
+    adapted_sum) VARIANT_ARGS="--action-loss sum --margins relative --redirect-bootstrap --redirect-margin-weight 1.0" ;;
     *) echo "unknown VARIANT $VARIANT" >&2; exit 1 ;;
 esac
 

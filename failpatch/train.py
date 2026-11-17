@@ -72,6 +72,8 @@ def main():
     parser.add_argument("--lambda-r", type=float, default=0.2)
     parser.add_argument("--lambda-t", type=float, default=0.05)
     parser.add_argument("--lambda-u", type=float, default=0.01)
+    parser.add_argument("--action-loss", default="sum", choices=("sum", "mean"),
+                        help="candidate action loss: squared L2 norm as in the paper (sum) or per-entry mean")
     parser.add_argument("--fail-temperature", type=float, default=0.2)
     parser.add_argument("--null-margin", type=float, default=0.1)
     parser.add_argument("--redirect-margin-weight", type=float, default=0.01)
@@ -220,7 +222,7 @@ def main():
         temperature = 1.0 + (0.2 - 1.0) * (step - 1) / max(1, args.steps - 1)  # T_d: 1.0 -> 0.2
         z, target, mask = sample(demo, args.batch_size)
         l_expert, l_router, stats = demo_loss(reb, z, target, mask, adapter.project, temperature,
-                                              null_enabled=step > args.warmup_steps)
+                                              null_enabled=step > args.warmup_steps, reduction=args.action_loss)
         loss = l_expert + args.lambda_rd * l_router
         stats.update(expert=float(l_expert), router_demo=float(l_router))
         if plus:
@@ -258,7 +260,7 @@ def main():
         feature_extraction_s=feature_s, features_from_cache=feature_cache_hits, prototype_s=prototype_s, optimization_s=optimization_s,
         model_load_s=load_s, steps=args.steps, demo_draws=n_draws,
         trainable_params=n_params, trainable_fraction=n_params / vla_params,
-        buffer_chunks=buffer_stats, energy_scale=scale, geometry=geometry,
+        buffer_chunks=buffer_stats, energy_scale=scale, geometry=geometry, action_loss=args.action_loss,
         margins=args.margins, null_margin=args.null_margin, redirect_margin=args.redirect_margin,
         redirect_bootstrap=args.redirect_bootstrap, peak_gpu_memory_mib=torch.cuda.max_memory_allocated() / 2**20,
         final=stats,

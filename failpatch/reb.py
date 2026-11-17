@@ -63,13 +63,18 @@ def _balanced_soft_ce(target: torch.Tensor, log_p: torch.Tensor) -> torch.Tensor
     return -(weight * target * log_p).sum(dim=-1).mean()
 
 
-def demo_loss(reb, z, target, mask, project, temperature: float, null_enabled: bool):
+def demo_loss(reb, z, target, mask, project, temperature: float, null_enabled: bool, reduction: str = "sum"):
     """Action-grounded patch learning on successful demonstrations (eqs. 6-9).
 
     z (B, T, d) frozen action-token hidden states, target (B, T, A) flow-matching target,
     mask (B, T, A) valid action dims, project: frozen W_v mapping (B, T, d) -> (B, T, A).
+
+    reduction: the paper writes l_k = ||W_v c_k - u||_2^2, a sum over the action entries ("sum").
+    "mean" divides by the number of valid entries; the losses are then ~200x smaller than the
+    temperature T_d (1.0 -> 0.2), every expert gets the same responsibility and the experts
+    collapse onto one another (observed: pairwise cosine 0.7-0.8 after training).
     """
-    denom = mask.sum(dim=(1, 2)).clamp_min(1.0)
+    denom = mask.sum(dim=(1, 2)).clamp_min(1.0) if reduction == "mean" else 1.0
     per_sample = lambda pred: (((pred.float() - target) ** 2) * mask).sum(dim=(1, 2)) / denom  # noqa: E731
     with torch.no_grad():
         loss_null = per_sample(project(z))  # (B,)
