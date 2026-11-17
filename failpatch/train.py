@@ -7,21 +7,24 @@ Stage 1 (feature extraction): for every demonstration sample, run the frozen VLA
   same objective (without image augmentation) at a fraction of the cost.
 Stage 2 (optimisation): the Preserve-Redirect-Trust objective on the REB only.
   --schedule fixed     `--steps` steps, cosine learning rate, T_d 1.0 -> 0.2 over the whole run.
-  --schedule converge  (default) train until a fixed validation set stops improving:
-    * validation set: the last `--val-demo-fraction` of the demonstrations of every task (whole
-      demonstrations, never trained on) plus fixed subsets of H+ and H-; evaluated every
+  --schedule converge  (default) train until the objective on a fixed monitoring set stops improving:
+    * monitoring set: a fixed subset of the training demonstrations (every `--monitor-every`-th
+      sample; all demonstrations are trained on, as in the paper; `--val-demo-fraction` > 0 holds
+      whole demonstrations out instead) plus fixed subsets of H+ and H-. It measures whether the
+      optimisation still progresses, not generalisation: in robot learning offline losses track
+      rollout success poorly, so success rates are the only quality measure. Evaluated every
       `--eval-every` steps at the final temperature (T_d = 0.2) with Null enabled, so the numbers
       carry no minibatch noise and do not move with the temperature schedule;
     * learning rate: warm-up, then constant at the peak; T_d anneals 1.0 -> 0.2 over `--min-steps`
       (the paper's 30k) and then stays at 0.2;
     * converged once step >= `--min-steps` and, over the last `--patience` steps, neither the
-      validation objective nor the held-out best-expert action error improved on their earlier best
+      monitored objective nor the monitored best-expert action error improved on their earlier best
       by more than `--min-rel-improvement`, and the share of H+ / H- states routed to Null moved by
       less than `--max-route-change`;
     * then the learning rate decays (cosine) to `--lr-final` over max(`--decay-min-steps`,
       `--decay-fraction` x steps so far) and training stops. `--max-steps` bounds the whole run
       (decay included); hitting it is reported as stop_reason = "max_steps".
-    reb.pt is the final state; reb_best.pt the state with the lowest validation objective.
+    reb.pt is the final state; reb_best.pt the state with the lowest monitored objective.
 
 Reported in <out>/train_summary.json:
   sft_time_s = feature_extraction_s + optimization_s   (model loading is reported separately)
@@ -86,8 +89,11 @@ def main():
     parser.add_argument("--max-route-change", type=float, default=0.02)
     parser.add_argument("--decay-fraction", type=float, default=0.1)
     parser.add_argument("--decay-min-steps", type=int, default=3_000)
-    parser.add_argument("--val-demo-fraction", type=float, default=0.1,
-                        help="share of each task's demonstrations held out for validation (whole demonstrations)")
+    parser.add_argument("--val-demo-fraction", type=float, default=0.0,
+                        help="> 0: hold out this share of each task's demonstrations (whole demonstrations) for the "
+                             "convergence test; 0 (default): train on all and monitor a fixed subset of them")
+    parser.add_argument("--monitor-every", type=int, default=10,
+                        help="with --val-demo-fraction 0: every N-th demonstration sample is in the monitoring set")
     parser.add_argument("--val-draws", type=int, default=2, help="(noise, time) draws per held-out sample")
     parser.add_argument("--val-buffer-size", type=int, default=1024, help="H+ and H- rows per task for validation")
     parser.add_argument("--checkpoint-every", type=int, default=10_000)
@@ -176,25 +182,37 @@ def main():
             torch.save(demo[task], cache_file)
     feature_s = time.time() - tic
 
-    # Hold out whole demonstrations for validation. The cached features are stored sample by
-    # sample, `--draws` rows each, in the order of demos_<task>.npz (sorted by demonstration).
+    # Monitoring set for the convergence test. By default it is a fixed subset of the TRAINING
+    # demonstrations (every `--monitor-every`-th sample, first `--val-draws` draws): all 50
+    # demonstrations are trained on, as in the paper, and the test only asks whether the
+    # optimisation still makes progress. Success rates in rollouts are the only quality measure.
+    # `--val-demo-fraction` > 0 instead holds out whole demonstrations (never trained on).
+    # The cached features are stored sample by sample, `--draws` rows each, in the order of
+    # demos_<task>.npz (sorted by demonstration).
     val_demo, val_info = {}, {}
-    if args.schedule == "converge" and args.val_demo_fraction > 0:
+    if args.schedule == "converge":
         for task in args.tasks:
             z, target, mask = demo[task]
             episode_ids = np.load(Path(args.demos) / f"demos_{task}.npz")["episode_ids"]
             if len(z) != len(episode_ids) * args.draws:
                 raise RuntimeError(f"{task}: {len(z)} feature rows != {len(episode_ids)} samples x {args.draws} draws")
-            episodes = sorted(set(episode_ids.tolist()))
-            n_val = max(1, round(args.val_demo_fraction * len(episodes)))
-            held = np.isin(episode_ids, episodes[-n_val:])
-            rows = torch.from_numpy(np.repeat(held, args.draws))
             first = torch.from_numpy(np.tile(np.arange(args.draws) < args.val_draws, len(episode_ids)))
-            demo[task] = (z[~rows], target[~rows], mask[~rows])
+            episodes = sorted(set(episode_ids.tolist()))
+            if args.val_demo_fraction > 0:
+                n_val = max(1, round(args.val_demo_fraction * len(episodes)))
+                held = np.isin(episode_ids, episodes[-n_val:])
+                rows = torch.from_numpy(np.repeat(held, args.draws))
+                demo[task] = (z[~rows], target[~rows], mask[~rows])
+                val_info[task] = dict(source="held-out demonstrations", val_demonstrations=n_val,
+                                      train_demonstrations=len(episodes) - n_val, val_samples=int(held.sum()))
+            else:
+                held = np.arange(len(episode_ids)) % args.monitor_every == 0
+                rows = torch.from_numpy(np.repeat(held, args.draws))
+                val_info[task] = dict(source="fixed subset of the training demonstrations",
+                                      train_demonstrations=len(episodes), val_samples=int(held.sum()))
             val_demo[task] = (z[rows & first], target[rows & first], mask[rows & first])
-            val_info[task] = dict(val_demonstrations=n_val, train_demonstrations=len(episodes) - n_val,
-                                  val_samples=int(held.sum()), val_rows=int((rows & first).sum()))
-        print(f"[train] validation demonstrations held out: {val_info}", flush=True)
+            val_info[task]["val_rows"] = int((rows & first).sum())
+        print(f"[train] convergence monitoring set: {val_info}", flush=True)
     n_draws = sum(len(v[0]) for v in demo.values())
     print(f"[train] demo features: {n_draws} (sample, noise, time) draws in {feature_s:.0f}s", flush=True)
 
