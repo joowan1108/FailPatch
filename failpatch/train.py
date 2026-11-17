@@ -109,9 +109,10 @@ def main():
     parser.add_argument("--null-margin", type=float, default=0.1)
     parser.add_argument("--redirect-margin-weight", type=float, default=0.01)
     parser.add_argument("--redirect-margin", type=float, default=0.1)
-    parser.add_argument("--margins", default="paper", choices=("paper", "relative"),
+    parser.add_argument("--margins", default="paper", choices=("paper", "relative", "task"),
                         help="paper: --null-margin / --redirect-margin as given (0.1). relative: both are set to "
-                             "--margin-fraction of the measured gap between failure and success representations")
+                             "--margin-fraction of the measured gap between failure and success representations, "
+                             "averaged over all tasks. task: the same, but measured and applied per task")
     parser.add_argument("--margin-fraction", type=float, default=0.5)
     parser.add_argument("--redirect-bootstrap", action="store_true",
                         help="push experts towards the success prototype before any of them clears the Null threshold")
@@ -211,15 +212,29 @@ def main():
                 gaps[task] = [prototype_distance_gap(h_minus[:, s].to(device), pool[:, s].to(device), args.k_nn)
                               for s in range(steps)]
         print(f"[train] deployment buffer chunks: {buffer_stats}", flush=True)
-    geometry = {}
+    geometry, task_margins = {}, {}
     if gaps:
         d_fail = float(np.mean([g[0] for task in gaps for g in gaps[task]]))
         d_succ = float(np.mean([g[1] for task in gaps for g in gaps[task]]))
         geometry = dict(dist_fail_to_prototype=d_fail, dist_success_to_prototype=d_succ, gap=d_fail - d_succ)
         if args.margins == "relative":
             args.null_margin = args.redirect_margin = max(1e-4, args.margin_fraction * (d_fail - d_succ))
+        for task in gaps:
+            t_fail = float(np.mean([g[0] for g in gaps[task]]))
+            t_succ = float(np.mean([g[1] for g in gaps[task]]))
+            geometry.setdefault("per_task", {})[task] = dict(dist_fail_to_prototype=t_fail, dist_success_to_prototype=t_succ,
+                                                             gap=t_fail - t_succ)
+            if args.margins == "task":
+                m = max(1e-4, args.margin_fraction * (t_fail - t_succ))
+                task_margins[task] = dict(null=m, redirect=m)
+            else:
+                task_margins[task] = dict(null=args.null_margin, redirect=args.redirect_margin)
+        if args.margins == "task":
+            print(f"[train] per-task margins: { {t: round(v['null'], 4) for t, v in task_margins.items()} }", flush=True)
+        margin_text = ("margins per task (above)" if args.margins == "task" else
+                       f"null margin {args.null_margin:.4f}, redirect margin {args.redirect_margin:.4f} ({args.margins})")
         print(f"[train] prototype distances: failure {d_fail:.3f}, success {d_succ:.3f}, gap {d_fail - d_succ:.3f} -> "
-              f"null margin {args.null_margin:.4f}, redirect margin {args.redirect_margin:.4f} ({args.margins})", flush=True)
+              + margin_text, flush=True)
     prototype_s = time.time() - tic
 
     # ---- stage 2: optimise the REB --------------------------------------------------------
@@ -280,7 +295,11 @@ def main():
             parts.append(tuple(t[idx] for t in item) if isinstance(item, tuple) else (item[idx],))
         return tuple(torch.cat(col).to(device).float() for col in zip(*parts))
 
-    minus_store = {t: (minus[t], protos[t]) for t in minus}
+    # every H- row carries its task's Null and Redirect margins
+    minus_store = {t: (minus[t], protos[t],
+                       torch.full((len(minus[t]),), task_margins[t]["null"] if t in task_margins else args.null_margin),
+                       torch.full((len(minus[t]),), task_margins[t]["redirect"] if t in task_margins else args.redirect_margin))
+                   for t in minus}
 
     # fixed validation subsets of the deployment buffer (the same rows at every evaluation)
     g = torch.Generator().manual_seed(args.seed)
@@ -289,7 +308,7 @@ def main():
     val_minus = {}
     for t in minus_store:
         idx = pick(len(minus_store[t][0]))
-        val_minus[t] = (minus_store[t][0][idx], minus_store[t][1][idx])
+        val_minus[t] = tuple(x[idx] for x in minus_store[t])
 
     def chunks(item, size=256):
         first = item[0] if isinstance(item, tuple) else item
@@ -316,9 +335,9 @@ def main():
                 add(task, "preserve", preserve_loss(reb, h, scale), len(h))
                 add(task, "null_top1_plus", (reb.log_probs(h).argmax(dim=1) == 0).float().mean(), len(h))
         for task, item in val_minus.items():
-            for h, proto in chunks(item):
-                l_r, l_t, st = redirect_trust_loss(reb, h, proto, args.lambda_u, args.fail_temperature, args.null_margin,
-                                                   args.redirect_margin_weight, args.redirect_margin, scale,
+            for h, proto, m_null, m_red in chunks(item):
+                l_r, l_t, st = redirect_trust_loss(reb, h, proto, args.lambda_u, args.fail_temperature, m_null,
+                                                   args.redirect_margin_weight, m_red, scale,
                                                    bootstrap=args.redirect_bootstrap)
                 add(task, "redirect", l_r, len(h)); add(task, "trust", l_t, len(h))
                 for k in ("redirect_null_target", "progress_best", "energy_best"):
@@ -376,9 +395,9 @@ def main():
             loss = loss + args.lambda_p * l_p
             stats["preserve"] = float(l_p)
         if minus_store:
-            h, proto = sample(minus_store, args.batch_size)
+            h, proto, m_null, m_red = sample(minus_store, args.batch_size)
             l_r, l_t, extra = redirect_trust_loss(reb, h, proto, args.lambda_u, args.fail_temperature,
-                                                  args.null_margin, args.redirect_margin_weight, args.redirect_margin, scale,
+                                                  m_null, args.redirect_margin_weight, m_red, scale,
                                                   bootstrap=args.redirect_bootstrap)
             loss = loss + args.lambda_r * l_r + args.lambda_t * l_t
             stats.update(redirect=float(l_r), trust=float(l_t), **extra)
@@ -446,7 +465,7 @@ def main():
         best_val_step=best["step"], demo_draws=n_draws,
         trainable_params=n_params, trainable_fraction=n_params / vla_params,
         buffer_chunks=buffer_stats, energy_scale=scale, geometry=geometry, action_loss=args.action_loss,
-        margins=args.margins, null_margin=args.null_margin, redirect_margin=args.redirect_margin,
+        margins=args.margins, null_margin=args.null_margin, redirect_margin=args.redirect_margin, task_margins=task_margins,
         redirect_bootstrap=args.redirect_bootstrap, peak_gpu_memory_mib=torch.cuda.max_memory_allocated() / 2**20,
         final=stats,
     )

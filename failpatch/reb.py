@@ -107,7 +107,12 @@ def redirect_trust_loss(reb, h, proto, lambda_u, temperature, null_margin, lambd
     """Failure-associated states H-: route to experts that move the representation toward the
     local success prototype (eqs. 11-13) with bounded intervention (eq. 14).
 
-    proto is the prototype in the l2-normalised space, where all distances are measured."""
+    proto is the prototype in the l2-normalised space, where all distances are measured.
+    null_margin / margin_r: floats, or (B,) tensors when every row carries its own (task) margin."""
+    if torch.is_tensor(null_margin):
+        null_margin = null_margin.to(h.device)
+    if torch.is_tensor(margin_r):
+        margin_r = margin_r.to(h.device)[:, None]
     dist = lambda x: (F.normalize(x, dim=-1) - proto).norm(dim=-1)  # noqa: E731
     deltas = reb.deltas(h)  # (K, B, d)
     energy = (deltas / scale).pow(2).sum(dim=-1).transpose(0, 1)  # (B, K)
