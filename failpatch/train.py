@@ -5,7 +5,23 @@ Stage 1 (feature extraction): for every demonstration sample, run the frozen VLA
   states and the flow-matching targets. The paper runs the frozen backbone inside the training
   loop instead; because every weight of the VLA is frozen, doing it once up front optimises the
   same objective (without image augmentation) at a fraction of the cost.
-Stage 2 (optimisation): 30k steps of the Preserve-Redirect-Trust objective on the REB only.
+Stage 2 (optimisation): the Preserve-Redirect-Trust objective on the REB only.
+  --schedule fixed     `--steps` steps, cosine learning rate, T_d 1.0 -> 0.2 over the whole run.
+  --schedule converge  (default) train until a fixed validation set stops improving:
+    * validation set: the last `--val-demo-fraction` of the demonstrations of every task (whole
+      demonstrations, never trained on) plus fixed subsets of H+ and H-; evaluated every
+      `--eval-every` steps at the final temperature (T_d = 0.2) with Null enabled, so the numbers
+      carry no minibatch noise and do not move with the temperature schedule;
+    * learning rate: warm-up, then constant at the peak; T_d anneals 1.0 -> 0.2 over `--min-steps`
+      (the paper's 30k) and then stays at 0.2;
+    * converged once step >= `--min-steps` and, over the last `--patience` steps, neither the
+      validation objective nor the held-out best-expert action error improved on their earlier best
+      by more than `--min-rel-improvement`, and the share of H+ / H- states routed to Null moved by
+      less than `--max-route-change`;
+    * then the learning rate decays (cosine) to `--lr-final` over max(`--decay-min-steps`,
+      `--decay-fraction` x steps so far) and training stops. `--max-steps` bounds the whole run
+      (decay included); hitting it is reported as stop_reason = "max_steps".
+    reb.pt is the final state; reb_best.pt the state with the lowest validation objective.
 
 Reported in <out>/train_summary.json:
   sft_time_s = feature_extraction_s + optimization_s   (model loading is reported separately)
@@ -57,7 +73,22 @@ def main():
     parser.add_argument("--draws", type=int, default=16)
     parser.add_argument("--feature-cache", default=None,
                         help="directory to store/reuse the frozen demonstration features across variants")
-    parser.add_argument("--steps", type=int, default=30_000)
+    parser.add_argument("--schedule", default="converge", choices=("converge", "fixed"))
+    parser.add_argument("--steps", type=int, default=30_000, help="--schedule fixed: number of steps")
+    parser.add_argument("--min-steps", type=int, default=30_000,
+                        help="--schedule converge: no stop before this; also the length of the T_d annealing")
+    parser.add_argument("--max-steps", type=int, default=150_000)
+    parser.add_argument("--eval-every", type=int, default=1_000)
+    parser.add_argument("--patience", type=int, default=10_000)
+    parser.add_argument("--min-rel-improvement", type=float, default=0.01)
+    parser.add_argument("--max-route-change", type=float, default=0.02)
+    parser.add_argument("--decay-fraction", type=float, default=0.1)
+    parser.add_argument("--decay-min-steps", type=int, default=3_000)
+    parser.add_argument("--val-demo-fraction", type=float, default=0.1,
+                        help="share of each task's demonstrations held out for validation (whole demonstrations)")
+    parser.add_argument("--val-draws", type=int, default=2, help="(noise, time) draws per held-out sample")
+    parser.add_argument("--val-buffer-size", type=int, default=1024, help="H+ and H- rows per task for validation")
+    parser.add_argument("--checkpoint-every", type=int, default=10_000)
     parser.add_argument("--warmup-steps", type=int, default=5_000, help="Null-disabled warm-up")
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=2.5e-5, help="peak learning rate")
@@ -138,6 +169,26 @@ def main():
             cache_dir.mkdir(parents=True, exist_ok=True)
             torch.save(demo[task], cache_file)
     feature_s = time.time() - tic
+
+    # Hold out whole demonstrations for validation. The cached features are stored sample by
+    # sample, `--draws` rows each, in the order of demos_<task>.npz (sorted by demonstration).
+    val_demo, val_info = {}, {}
+    if args.schedule == "converge" and args.val_demo_fraction > 0:
+        for task in args.tasks:
+            z, target, mask = demo[task]
+            episode_ids = np.load(Path(args.demos) / f"demos_{task}.npz")["episode_ids"]
+            if len(z) != len(episode_ids) * args.draws:
+                raise RuntimeError(f"{task}: {len(z)} feature rows != {len(episode_ids)} samples x {args.draws} draws")
+            episodes = sorted(set(episode_ids.tolist()))
+            n_val = max(1, round(args.val_demo_fraction * len(episodes)))
+            held = np.isin(episode_ids, episodes[-n_val:])
+            rows = torch.from_numpy(np.repeat(held, args.draws))
+            first = torch.from_numpy(np.tile(np.arange(args.draws) < args.val_draws, len(episode_ids)))
+            demo[task] = (z[~rows], target[~rows], mask[~rows])
+            val_demo[task] = (z[rows & first], target[rows & first], mask[rows & first])
+            val_info[task] = dict(val_demonstrations=n_val, train_demonstrations=len(episodes) - n_val,
+                                  val_samples=int(held.sum()), val_rows=int((rows & first).sum()))
+        print(f"[train] validation demonstrations held out: {val_info}", flush=True)
     n_draws = sum(len(v[0]) for v in demo.values())
     print(f"[train] demo features: {n_draws} (sample, noise, time) draws in {feature_s:.0f}s", flush=True)
 
@@ -189,12 +240,26 @@ def main():
     n_params = sum(p.numel() for p in reb.parameters())
     opt = torch.optim.AdamW(reb.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
+    converge = args.schedule == "converge"
+    anneal_steps = args.min_steps if converge else args.steps
+    decay = dict(start=None, length=None, reason=None)
+
+    def temperature_at(step: int) -> float:
+        """T_d: 1.0 -> 0.2 linearly over the annealing horizon, then constant."""
+        return 1.0 + (0.2 - 1.0) * min(1.0, (step - 1) / max(1, anneal_steps - 1))
+
     def learning_rate(step: int) -> float:
-        """Linear warm-up to the peak, then cosine decay. The paper only states the peak value
-        (2.5e-5); warm-up length and final value are the OpenPI defaults its code base uses."""
+        """Linear warm-up to the peak, then cosine decay (fixed: over the whole run; converge: only
+        after convergence). The paper only states the peak value (2.5e-5); warm-up length and final
+        value are the OpenPI defaults its code base uses."""
         if step <= args.lr_warmup_steps:
             return args.lr * step / max(1, args.lr_warmup_steps)
-        progress = (step - args.lr_warmup_steps) / max(1, args.steps - args.lr_warmup_steps)
+        if converge:
+            if decay["start"] is None:
+                return args.lr
+            progress = min(1.0, (step - decay["start"]) / decay["length"])
+        else:
+            progress = (step - args.lr_warmup_steps) / max(1, args.steps - args.lr_warmup_steps)
         return args.lr_final + 0.5 * (args.lr - args.lr_final) * (1 + math.cos(math.pi * progress))
 
     for p in adapter.model.parameters():
@@ -216,10 +281,91 @@ def main():
         return tuple(torch.cat(col).to(device).float() for col in zip(*parts))
 
     minus_store = {t: (minus[t], protos[t]) for t in minus}
+
+    # fixed validation subsets of the deployment buffer (the same rows at every evaluation)
+    g = torch.Generator().manual_seed(args.seed)
+    pick = lambda n: torch.randperm(n, generator=g)[: args.val_buffer_size]  # noqa: E731
+    val_plus = {t: plus[t][pick(len(plus[t]))] for t in plus}
+    val_minus = {}
+    for t in minus_store:
+        idx = pick(len(minus_store[t][0]))
+        val_minus[t] = (minus_store[t][0][idx], minus_store[t][1][idx])
+
+    def chunks(item, size=256):
+        first = item[0] if isinstance(item, tuple) else item
+        for i in range(0, len(first), size):
+            yield tuple(x[i : i + size].to(device).float() for x in (item if isinstance(item, tuple) else (item,)))
+
+    @torch.no_grad()
+    def evaluate() -> dict:
+        """Validation metrics, averaged over chunks within a task and then over tasks (task-balanced
+        like the minibatches). The total uses the training weights at T_d = 0.2 with Null enabled."""
+        acc = {}
+
+        def add(task, key, value, n):
+            acc.setdefault(key, {}).setdefault(task, []).append((float(value), n))
+
+        for task, item in val_demo.items():
+            for z, target, mask in chunks(item):
+                l_e, l_r, st = demo_loss(reb, z, target, mask, adapter.project, 0.2, True, reduction=args.action_loss)
+                add(task, "demo_expert", l_e, len(z)); add(task, "demo_router", l_r, len(z))
+                for k in ("loss_best", "loss_null", "demo_null_target"):
+                    add(task, "demo_" + k.replace("demo_", ""), st[k], len(z))
+        for task, item in val_plus.items():
+            for (h,) in chunks(item):
+                add(task, "preserve", preserve_loss(reb, h, scale), len(h))
+                add(task, "null_top1_plus", (reb.log_probs(h).argmax(dim=1) == 0).float().mean(), len(h))
+        for task, item in val_minus.items():
+            for h, proto in chunks(item):
+                l_r, l_t, st = redirect_trust_loss(reb, h, proto, args.lambda_u, args.fail_temperature, args.null_margin,
+                                                   args.redirect_margin_weight, args.redirect_margin, scale,
+                                                   bootstrap=args.redirect_bootstrap)
+                add(task, "redirect", l_r, len(h)); add(task, "trust", l_t, len(h))
+                for k in ("redirect_null_target", "progress_best", "energy_best"):
+                    add(task, k, st[k], len(h))
+                add(task, "null_top1_minus", (reb.log_probs(h).argmax(dim=1) == 0).float().mean(), len(h))
+        m = {k: float(np.mean([sum(v * n for v, n in xs) / sum(n for _, n in xs) for xs in per_task.values()]))
+             for k, per_task in acc.items()}
+        m["objective"] = (m.get("demo_expert", 0) + args.lambda_rd * m.get("demo_router", 0) + args.lambda_p * m.get("preserve", 0)
+                          + args.lambda_r * m.get("redirect", 0) + args.lambda_t * m.get("trust", 0))
+        return {"val_" + k: v for k, v in m.items()}
+
+    history = []  # (step, metrics)
+    best = dict(objective=float("inf"), step=None)  # lowest validation objective -> reb_best.pt
+
+    def converged(step: int) -> tuple[bool, dict]:
+        """Long-window test: compare the best value of the last `patience` steps with the best value
+        before that window, and the routing now with the routing `patience` steps ago."""
+        old = [(s_, m) for s_, m in history if s_ <= step - args.patience]
+        new = [(s_, m) for s_, m in history if s_ > step - args.patience]
+        if step < args.min_steps or not old or not new:
+            return False, {}
+        info = {}
+        ok = True
+        for key in ("val_objective", "val_demo_loss_best"):
+            if key not in new[-1][1]:
+                continue
+            best_old, best_new = min(m[key] for _, m in old), min(m[key] for _, m in new)
+            rel = (best_old - best_new) / max(abs(best_old), 1e-12)
+            info[key + "_rel_improvement"] = rel
+            ok &= rel < args.min_rel_improvement
+        ref = old[-1][1]
+        for key in ("val_null_top1_plus", "val_null_top1_minus"):
+            if key in ref:
+                change = abs(new[-1][1][key] - ref[key])
+                info[key + "_change"] = change
+                ok &= change < args.max_route_change
+        return ok, info
+
+    ckpt_dir = out / "checkpoints"
     tic = time.time()
+    eval_s = 0.0
     log = (out / "train_log.jsonl").open("w")
-    for step in range(1, args.steps + 1):
-        temperature = 1.0 + (0.2 - 1.0) * (step - 1) / max(1, args.steps - 1)  # T_d: 1.0 -> 0.2
+    val_log = (out / "val_log.jsonl").open("w")
+    step = 0
+    while True:
+        step += 1
+        temperature = temperature_at(step)
         z, target, mask = sample(demo, args.batch_size)
         l_expert, l_router, stats = demo_loss(reb, z, target, mask, adapter.project, temperature,
                                               null_enabled=step > args.warmup_steps, reduction=args.action_loss)
@@ -236,20 +382,56 @@ def main():
                                                   bootstrap=args.redirect_bootstrap)
             loss = loss + args.lambda_r * l_r + args.lambda_t * l_t
             stats.update(redirect=float(l_r), trust=float(l_t), **extra)
+        lr = learning_rate(step)
         for group in opt.param_groups:
-            group["lr"] = learning_rate(step)
+            group["lr"] = lr
         opt.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(reb.parameters(), 1.0)
         opt.step()
         if step % 200 == 0 or step == 1:
-            stats.update(step=step, loss=float(loss), elapsed_s=time.time() - tic)
+            stats.update(step=step, loss=float(loss), lr=lr, temperature=temperature, elapsed_s=time.time() - tic)
             log.write(json.dumps(stats) + "\n")
             log.flush()
             if step % 2000 == 0 or step == 1:
                 print("[train] " + " ".join(f"{k}={v:.4g}" for k, v in stats.items()), flush=True)
+        if args.checkpoint_every and step % args.checkpoint_every == 0:
+            ckpt_dir.mkdir(exist_ok=True)
+            torch.save(dict(config=reb.config(), state_dict=reb.state_dict(), args=vars(args), step=step),
+                       ckpt_dir / f"reb_step{step:06d}.pt")
+
+        if not converge:
+            if step >= args.steps:
+                decay.update(reason="fixed_steps")
+                break
+            continue
+        if decay["start"] is not None and step >= decay["start"] + decay["length"]:
+            break
+        if step % args.eval_every == 0 or step == args.max_steps:
+            t_eval = time.time()
+            metrics = evaluate()
+            eval_s += time.time() - t_eval
+            history.append((step, metrics))
+            if metrics["val_objective"] < best["objective"]:
+                best.update(objective=metrics["val_objective"], step=step)
+                torch.save(dict(config=reb.config(), state_dict=reb.state_dict(), args=vars(args), step=step),
+                           out / "reb_best.pt")
+            info = {}
+            if decay["start"] is None:
+                done, info = converged(step)
+                length = max(args.decay_min_steps, round(args.decay_fraction * step))
+                if done or step + length >= args.max_steps:
+                    decay.update(start=step, length=min(length, max(1, args.max_steps - step)),
+                                 reason="converged" if done else "max_steps", converged_at=step if done else None)
+                    print(f"[train] {decay['reason']} at step {step} ({info}); learning-rate decay over "
+                          f"{decay['length']} steps", flush=True)
+            val_log.write(json.dumps(dict(step=step, lr=lr, temperature=temperature, **metrics, **info)) + "\n")
+            val_log.flush()
+            print("[val] step=%d %s" % (step, " ".join(f"{k[4:]}={v:.4g}" for k, v in metrics.items())), flush=True)
+    final_val = evaluate() if converge else {}
     optimization_s = time.time() - tic
     log.close()
+    val_log.close()
 
     torch.save(dict(config=reb.config(), state_dict=reb.state_dict(), args=vars(args)), out / "reb.pt")
     vla_params = sum(p.numel() for p in adapter.model.parameters())
@@ -258,7 +440,10 @@ def main():
         gpu=torch.cuda.get_device_name(0),
         sft_time_s=feature_s + prototype_s + optimization_s,
         feature_extraction_s=feature_s, features_from_cache=feature_cache_hits, prototype_s=prototype_s, optimization_s=optimization_s,
-        model_load_s=load_s, steps=args.steps, demo_draws=n_draws,
+        model_load_s=load_s, steps=step, schedule=args.schedule, stop_reason=decay["reason"],
+        converged_at_step=decay.get("converged_at"), decay_start_step=decay["start"], decay_steps=decay["length"],
+        evaluation_s=eval_s, validation=val_info, final_val=final_val, best_val_objective=best["objective"] if best["step"] is not None else None,
+        best_val_step=best["step"], demo_draws=n_draws,
         trainable_params=n_params, trainable_fraction=n_params / vla_params,
         buffer_chunks=buffer_stats, energy_scale=scale, geometry=geometry, action_loss=args.action_loss,
         margins=args.margins, null_margin=args.null_margin, redirect_margin=args.redirect_margin,

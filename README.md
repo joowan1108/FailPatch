@@ -23,7 +23,7 @@ VLA 는 전부 얼리고, 액션 헤드 직전에 **Null-gated Residual Expert B
    - Trust: 개입 크기 제한
 4. **추론**: 청크마다 라우터가 Top-1 경로를 골라 그대로 두거나 보정
 
-하이퍼파라미터는 논문 표 5 그대로입니다(30k 스텝, 워밍업 5k, 배치 32, lr 2.5e-5, λ_P=λ_R=0.2, λ_T=0.05 등).
+하이퍼파라미터는 논문 표 5 그대로입니다(Null 워밍업 5k, 배치 32, lr 2.5e-5, λ_P=λ_R=0.2, λ_T=0.05 등). 학습 길이만 30k 고정 대신 수렴할 때까지입니다(아래).
 
 ## 논문과 다른 점
 
@@ -38,6 +38,22 @@ VLA 는 전부 얼리고, 액션 헤드 직전에 **Null-gated Residual Expert B
 | Redirect 문턱값 (m, m_r) | 0.1 고정 | `VARIANT=adapted`: 실패·성공 표현 사이 거리 차이의 절반 | XR-1 에서 실패 표현은 성공 프로토타입에서 0.215, 성공 표현은 0.174 떨어져 있어 두 집단의 차이가 0.041 뿐. 0.1 은 그 차이보다 훨씬 커서 처음에 넘는 전문가가 없음 |
 | Redirect 의 당기는 신호 | 문턱을 넘은 전문가에게만, 가중치 0.01 | `VARIANT=adapted`: 처음부터 모든 전문가에게, 가중치 1.0 | 논문 방식으로는 어떤 전문가도 문턱을 넘지 못해 신호가 시작되지 않음. 실제 버퍼로 확인: 논문 설정은 실패 구간 개입 0%, 수정 설정은 실패 구간 17% / 정상 구간 1% |
 | 클래스 균형 CE | 식 없음 | 경로별 타깃 질량의 역수로 가중 | 논문에 정의가 없어 해석 |
+| 학습 길이 | 30k 스텝 고정 | 수렴할 때까지 (최소 30k, 최대 150k). `--schedule fixed` 가 논문 방식 | 30k 고정으로 돌린 `adapted_sum` 은 마지막 1만 스텝에도 시연 액션 오차가 0.65 → 0.47 로 계속 내려가 수렴하지 않았음. 아래 "학습 길이" 참고 |
+| 학습률 스케줄 | 최댓값(2.5e-5)만 명시 | 워밍업 1k → 최댓값 유지 → 수렴 판정 뒤 코사인 감쇠 | 끝나는 스텝을 미리 모르므로 감쇠를 수렴 뒤로 미룸. `--schedule fixed` 는 전체 길이에 걸친 코사인 |
+| 시연 데이터 | 전부 학습 | 태스크마다 시연 10%(시연 단위)를 검증용으로 떼어 둠 | 수렴과 과적합을 학습에 쓰지 않은 데이터로 판단 |
+
+### 학습 길이 (`--schedule converge`, 기본)
+
+- 1,000 스텝마다 고정된 검증 세트에서 평가합니다: 떼어 둔 시연(샘플당 노이즈 2개)과 H+, H- 에서 고정으로 뽑은
+  태스크당 1,024 개. 온도는 마지막 값 T_d = 0.2, Null 은 켠 상태라서 미니배치 잡음이 없고 온도 스케줄에 따라 값이 바뀌지 않습니다.
+- T_d 는 처음 30k 스텝 동안 1.0 → 0.2 로 내려가고 그 뒤로는 0.2 입니다. 30k 전에는 멈추지 않습니다.
+- 수렴 조건 (모두 만족): 최근 10k 스텝 동안 ① 검증 목적함수와 ② 떼어 둔 시연의 최선 전문가 액션 오차가 그 이전의
+  최고값보다 1% 넘게 좋아지지 않았고, ③ H+ / H- 에서 Null 로 가는 비율이 10k 스텝 전과 비교해 0.02 넘게 바뀌지 않았음.
+  한 번의 평가가 아니라 1만 스텝(평가 10번) 구간 전체의 최고값끼리 비교하므로 일시적인 정체에서는 멈추지 않습니다.
+- 수렴하면 학습률을 max(3k, 지금까지 스텝의 10%) 동안 코사인으로 2.5e-6 까지 낮춘 뒤 멈춥니다.
+- 결과: `reb.pt` (마지막 상태, 평가에 사용), `reb_best.pt` (검증 목적함수가 가장 낮았던 상태),
+  `checkpoints/reb_step*.pt` (1만 스텝마다), `val_log.jsonl` (검증 기록). `train_summary.json` 의 `stop_reason`,
+  `converged_at_step`, `best_val_step` 에 언제 왜 멈췄는지 남습니다.
 
 ## 측정 항목
 
@@ -46,7 +62,7 @@ VLA 는 전부 얼리고, 액션 헤드 직전에 **Null-gated Residual Expert B
 | 항목 | 정의 |
 |---|---|
 | base SR / FailPatch SR | 같은 50개 시드(같은 장면)에서 원본 정책과 보정 모듈을 붙인 정책의 성공률 |
-| SFT time (s) | 시연 특징 추출 + 프로토타입 계산 + 30k 스텝 최적화의 벽시계 시간 (모델 로딩, 버퍼 수집, 주석 제외 — 각각 따로 기록) |
+| SFT time (s) | 시연 특징 추출 + 프로토타입 계산 + 수렴할 때까지의 최적화(검증 평가 포함)의 벽시계 시간 (모델 로딩, 버퍼 수집, 주석 제외 — 각각 따로 기록). 스텝 수와 멈춘 이유를 같이 적음 |
 | GPU / GPU hours | `nvidia-smi` 의 GPU 이름과, SFT 에 쓴 시간·파이프라인 전체에 쓴 시간. 예: `SFT took 1800 s = 0.50 h on 1x NVIDIA GeForce RTX 4090` |
 | mean GPU util / peak memory | 10초 간격으로 기록한 값 |
 | patched chunks % | 평가 중 Null 이 아닌 경로가 선택된 청크 비율 |
@@ -64,7 +80,7 @@ echo 'export ANTHROPIC_API_KEY=...' > /workspace/.api_env && chmod 600 /workspac
 
 # 짧은 확인 (모델 하나, 태스크 하나)
 MODELS=xr1 TASKS=CoffeeSetupMug EVAL_EPISODES=4 N_SUCCESS=3 N_FAIL=3 MAX_EPISODES=16 DEMO_SAMPLES=64 \
-  EXTRA_TRAIN_ARGS="--steps 600 --warmup-steps 100 --draws 4" RESULTS=/workspace/failpatch_smoke bash scripts/run_all.sh
+  EXTRA_TRAIN_ARGS="--schedule fixed --steps 600 --warmup-steps 100 --draws 4" RESULTS=/workspace/failpatch_smoke bash scripts/run_all.sh
 
 # 전체 실험 (결과: /workspace/failpatch_results)
 bash scripts/run_all.sh                  # VARIANT=adapted (기본)

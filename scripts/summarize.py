@@ -80,7 +80,8 @@ def main():
     table(header, rows)
 
     sft_header = ["model", "variant", "GPU", "SFT time (s)", "feature extraction (s)", "optimisation (s)",
-                  "trainable params", "GPU hours of SFT (h)", "peak GPU memory in SFT (MiB)"]
+                  "trainable params", "GPU hours of SFT (h)", "peak GPU memory in SFT (MiB)", "steps",
+                  "stop reason", "converged at step", "best validation step"]
     sft_rows = []
     for model_dir in models:
         for reb_dir in sorted(model_dir.glob("reb_*")):
@@ -92,7 +93,8 @@ def main():
                 model_dir.name, reb_dir.name[4:], f"1x {train.get('gpu', gpu)}", num(sft),
                 num(train["feature_extraction_s"]), num(train["optimization_s"]),
                 f"{train['trainable_params'] / 1e6:.1f}M ({100 * train['trainable_fraction']:.2f}%)",
-                num(sft / 3600, "{:.2f}"), num(train.get("peak_gpu_memory_mib")),
+                num(sft / 3600, "{:.2f}"), num(train.get("peak_gpu_memory_mib")), num(train.get("steps")),
+                train.get("stop_reason") or "fixed_steps", num(train.get("converged_at_step")), num(train.get("best_val_step")),
             ])
     print()
     table(sft_header, sft_rows)
