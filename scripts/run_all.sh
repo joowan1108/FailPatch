@@ -35,8 +35,8 @@ EXTRA_TRAIN_ARGS="${EXTRA_TRAIN_ARGS:-}"
 #   paper    hyper-parameters exactly as in the paper (table 5)
 #   adapted_sum  the paper's objective (summed action loss, Redirect push only on states where some
 #            expert clears the Null threshold) with Redirect margins = half the failure/success gap
-#            measured per task on the first 5 chunks after the failure onset, and Redirect margin
-#            weight 1.0 (paper 0.01). The archived old-buffer adapted_sum results used one margin for
+#            measured per task on the first 5 chunks after the failure onset, and the failure routing
+#            temperature scaled with it (T = 0.2 x margin / 0.1). Redirect margin weight 0.01 as in the paper. The archived old-buffer adapted_sum results used one margin for
 #            all tasks, measured on every H- chunk, and pushed on every H- state (--redirect-bootstrap)
 #   adapted  Redirect margins relative to the measured failure/success gap, experts pushed towards
 #            the success prototype from the start, and a stronger push (see README)
@@ -44,7 +44,7 @@ VARIANT="${VARIANT:-adapted}"
 case "$VARIANT" in
     paper)       VARIANT_ARGS="--action-loss sum" ;;
     adapted)     VARIANT_ARGS="--action-loss mean --margins relative --redirect-bootstrap --redirect-margin-weight 1.0" ;;
-    adapted_sum) VARIANT_ARGS="--action-loss sum --margins task --margin-onset-chunks 5 --redirect-margin-weight 1.0" ;;
+    adapted_sum) VARIANT_ARGS="--action-loss sum --margins task --margin-onset-chunks 5 --fail-temperature-scaling margin" ;;
     *) echo "unknown VARIANT $VARIANT" >&2; exit 1 ;;
 esac
 
