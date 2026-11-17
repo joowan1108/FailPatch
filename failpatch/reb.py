@@ -123,9 +123,10 @@ def redirect_trust_loss(reb, h, proto, lambda_u, temperature, null_margin, lambd
         q = torch.cat([q0[:, None], (1 - q0)[:, None] * F.softmax(utility / temperature, dim=1)], dim=1)
     log_p = reb.log_probs(h)
     route_ce = -(q * log_p).sum(dim=1)
-    # Paper: only experts already selected by the utility target (q_k > 0) are pushed towards the
-    # prototype. If no expert ever clears the Null threshold, that push never starts; `bootstrap`
-    # weights the push by the experts' relative utilities regardless of the Null gate.
+    # Paper: the push is weighted by the utility target q_k, which is non-zero for every expert
+    # (softmax of the utilities) on states where at least one expert clears the Null threshold,
+    # and zero on all other states. If no expert ever clears it, the push never starts;
+    # `bootstrap` uses the same utility softmax on every H- state, regardless of the Null gate.
     push = F.softmax(utility / temperature, dim=1) if bootstrap else q[:, 1:]
     hinge = (push * F.relu(margin_r - progress)).sum(dim=1)
     loss_redirect = (route_ce + lambda_r * hinge).mean()
