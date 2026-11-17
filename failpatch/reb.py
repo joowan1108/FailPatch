@@ -4,8 +4,13 @@
 The REB sits between the frozen VLA and its frozen action projection W_v:
   * router   p(h) = softmax(Linear(LayerNorm(h)))  over [Null, expert_1..K], h = mean of the
              action-token hidden states of the current chunk
-  * expert k delta_k(z) = W_down( SiLU(W_gate z) * (W_up z) ), W_down zero-initialised
-  * inference: Top-1 route; Null keeps z, expert k adds delta_k(z) to every action token.
+  * expert k delta_k(h) = W_down( SiLU(W_gate h) * (W_up h) ), W_down zero-initialised, computed
+             from the pooled h (supplement eq. 18), so c_k = h + delta_k(h) exactly
+  * inference: Top-1 route; Null keeps z, expert k adds the same delta_k(h) to every action token
+             ("applied to all action-token hidden states", S1.1); the frozen W_v then maps each
+             token to its action.
+  Until 11-17 the residual was computed token by token (delta_k(z_t)); the Redirect/Preserve
+  geometry, which is measured on the pooled h, then did not describe what inference executed.
 """
 
 from __future__ import annotations
@@ -46,12 +51,13 @@ class ResidualExpertBank(nn.Module):
         """Inference. z (B, T, d) action-token hidden states -> (patched z, route (B,))."""
         dtype = z.dtype
         zf = z.float()
-        route = self.router(self.norm(zf.mean(dim=1))).argmax(dim=-1)
+        h = zf.mean(dim=1)
+        route = self.router(self.norm(h)).argmax(dim=-1)
         out = zf.clone()
         for b in torch.nonzero(route > 0).flatten().tolist():
             k = int(route[b]) - 1
-            hidden = F.silu(zf[b] @ self.w_gate[k]) * (zf[b] @ self.w_up[k])
-            out[b] = zf[b] + hidden @ self.w_down[k]
+            hidden = F.silu(h[b] @ self.w_gate[k]) * (h[b] @ self.w_up[k])
+            out[b] = zf[b] + (hidden @ self.w_down[k])[None, :]  # same residual on every token
         return out.to(dtype), route
 
 
@@ -78,8 +84,8 @@ def demo_loss(reb, z, target, mask, project, temperature: float, null_enabled: b
     per_sample = lambda pred: (((pred.float() - target) ** 2) * mask).sum(dim=(1, 2)) / denom  # noqa: E731
     with torch.no_grad():
         loss_null = per_sample(project(z))  # (B,)
-    deltas = reb.deltas(z)  # (K, B, T, d)
-    loss_k = torch.stack([per_sample(project(z + deltas[k])) for k in range(reb.k)], dim=1)  # (B, K)
+    deltas = reb.deltas(z.float().mean(dim=1))  # (K, B, d): from the pooled h (supplement eq. 18)
+    loss_k = torch.stack([per_sample(project(z + deltas[k][:, None, :])) for k in range(reb.k)], dim=1)  # (B, K)
     w = F.softmax(-loss_k.detach() / temperature, dim=1)
     loss_expert = (w * loss_k).sum(dim=1).mean()
 
@@ -113,6 +119,8 @@ def redirect_trust_loss(reb, h, proto, lambda_u, temperature, null_margin, lambd
         null_margin = null_margin.to(h.device)
     if torch.is_tensor(margin_r):
         margin_r = margin_r.to(h.device)[:, None]
+    if torch.is_tensor(temperature):  # per-row (task) routing temperature
+        temperature = temperature.to(h.device)[:, None]
     dist = lambda x: (F.normalize(x, dim=-1) - proto).norm(dim=-1)  # noqa: E731
     deltas = reb.deltas(h)  # (K, B, d)
     energy = (deltas / scale).pow(2).sum(dim=-1).transpose(0, 1)  # (B, K)

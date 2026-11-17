@@ -122,6 +122,11 @@ def main():
                              "--margin-fraction of the measured gap between failure and success representations, "
                              "averaged over all tasks. task: the same, but measured and applied per task")
     parser.add_argument("--margin-fraction", type=float, default=0.5)
+    parser.add_argument("--fail-temperature-scaling", default="none", choices=("none", "margin"),
+                        help="margin: the failure routing temperature of every task is --fail-temperature x "
+                             "(task margin / --reference-margin), i.e. scaled with the margin so that the "
+                             "paper's ratio T/m = 0.2/0.1 is kept when the margins are rescaled")
+    parser.add_argument("--reference-margin", type=float, default=0.1, help="the paper's margin m")
     parser.add_argument("--margin-onset-chunks", type=int, default=0,
                         help="relative/task margins: measure the failure/success gap on the first N chunks after the "
                              "failure onset only (0 = every H- chunk). H- itself is unchanged")
@@ -263,8 +268,13 @@ def main():
                 task_margins[task] = dict(null=m, redirect=m)
             else:
                 task_margins[task] = dict(null=args.null_margin, redirect=args.redirect_margin)
+            task_margins[task]["temperature"] = (
+                args.fail_temperature * task_margins[task]["null"] / args.reference_margin
+                if args.fail_temperature_scaling == "margin" else args.fail_temperature)
         if args.margins == "task":
-            print(f"[train] per-task margins: { {t: round(v['null'], 4) for t, v in task_margins.items()} }", flush=True)
+            print(f"[train] per-task margins: { {t: round(v['null'], 4) for t, v in task_margins.items()} }, "
+                  f"failure routing temperatures: { {t: round(v['temperature'], 4) for t, v in task_margins.items()} }",
+                  flush=True)
         margin_text = ("margins per task (above)" if args.margins == "task" else
                        f"null margin {args.null_margin:.4f}, redirect margin {args.redirect_margin:.4f} ({args.margins})")
         print(f"[train] prototype distances: failure {d_fail:.3f}, success {d_succ:.3f}, gap {d_fail - d_succ:.3f} -> "
@@ -332,7 +342,8 @@ def main():
     # every H- row carries its task's Null and Redirect margins
     minus_store = {t: (minus[t], protos[t],
                        torch.full((len(minus[t]),), task_margins[t]["null"] if t in task_margins else args.null_margin),
-                       torch.full((len(minus[t]),), task_margins[t]["redirect"] if t in task_margins else args.redirect_margin))
+                       torch.full((len(minus[t]),), task_margins[t]["redirect"] if t in task_margins else args.redirect_margin),
+                       torch.full((len(minus[t]),), task_margins[t]["temperature"] if t in task_margins else args.fail_temperature))
                    for t in minus}
 
     # fixed validation subsets of the deployment buffer (the same rows at every evaluation)
@@ -369,8 +380,8 @@ def main():
                 add(task, "preserve", preserve_loss(reb, h, scale), len(h))
                 add(task, "null_top1_plus", (reb.log_probs(h).argmax(dim=1) == 0).float().mean(), len(h))
         for task, item in val_minus.items():
-            for h, proto, m_null, m_red in chunks(item):
-                l_r, l_t, st = redirect_trust_loss(reb, h, proto, args.lambda_u, args.fail_temperature, m_null,
+            for h, proto, m_null, m_red, t_fail in chunks(item):
+                l_r, l_t, st = redirect_trust_loss(reb, h, proto, args.lambda_u, t_fail, m_null,
                                                    args.redirect_margin_weight, m_red, scale,
                                                    bootstrap=args.redirect_bootstrap)
                 add(task, "redirect", l_r, len(h)); add(task, "trust", l_t, len(h))
@@ -429,8 +440,8 @@ def main():
             loss = loss + args.lambda_p * l_p
             stats["preserve"] = float(l_p)
         if minus_store:
-            h, proto, m_null, m_red = sample(minus_store, args.batch_size)
-            l_r, l_t, extra = redirect_trust_loss(reb, h, proto, args.lambda_u, args.fail_temperature,
+            h, proto, m_null, m_red, t_fail = sample(minus_store, args.batch_size)
+            l_r, l_t, extra = redirect_trust_loss(reb, h, proto, args.lambda_u, t_fail,
                                                   m_null, args.redirect_margin_weight, m_red, scale,
                                                   bootstrap=args.redirect_bootstrap)
             loss = loss + args.lambda_r * l_r + args.lambda_t * l_t
