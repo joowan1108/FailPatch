@@ -44,9 +44,10 @@ from failpatch.reb import (ResidualExpertBank, demo_loss, local_success_prototyp
 
 
 def load_buffer(task_dir: Path):
-    """-> reliable-success pool, H+ and H- representations, each (N, S, d) float32."""
+    """-> reliable-success pool, H+ and H- representations, each (N, S, d) float32, and for every
+    H- row its chunk offset from the failure onset (0 = onset chunk)."""
     labels = json.loads((task_dir / "labels.json").read_text())
-    pool, plus, minus = [], [], []
+    pool, plus, minus, offset = [], [], [], []
     for stem, lab in labels.items():
         hidden = np.load(task_dir / "buffer" / f"{stem}.npz")["hidden"].astype(np.float32)
         if lab["success"]:
@@ -57,8 +58,9 @@ def load_buffer(task_dir: Path):
             onset = lab["failure_onset_chunk"]
             plus.append(hidden[:onset])
             minus.append(hidden[onset:])
+            offset.append(np.arange(len(hidden) - onset))
     cat = lambda xs: torch.from_numpy(np.concatenate(xs)) if xs and sum(len(x) for x in xs) else None  # noqa: E731
-    return cat(pool), cat(plus), cat(minus)
+    return cat(pool), cat(plus), cat(minus), (np.concatenate(offset) if offset else np.zeros(0, int))
 
 
 def main():
@@ -114,6 +116,9 @@ def main():
                              "--margin-fraction of the measured gap between failure and success representations, "
                              "averaged over all tasks. task: the same, but measured and applied per task")
     parser.add_argument("--margin-fraction", type=float, default=0.5)
+    parser.add_argument("--margin-onset-chunks", type=int, default=0,
+                        help="relative/task margins: measure the failure/success gap on the first N chunks after the "
+                             "failure onset only (0 = every H- chunk). H- itself is unchanged")
     parser.add_argument("--redirect-bootstrap", action="store_true",
                         help="push experts towards the success prototype before any of them clears the Null threshold")
     parser.add_argument("--energy-scale", default="auto",
@@ -195,10 +200,10 @@ def main():
 
     # ---- deployment buffer: H+, H- and local success prototypes -------------------------
     tic = time.time()
-    plus, minus, protos, buffer_stats, gaps = {}, {}, {}, {}, {}
+    plus, minus, protos, buffer_stats, gaps, gaps_all = {}, {}, {}, {}, {}, {}
     if not args.demo_only:
         for task in args.tasks:
-            pool, h_plus, h_minus = load_buffer(Path(args.results) / task)
+            pool, h_plus, h_minus, onset_offset = load_buffer(Path(args.results) / task)
             buffer_stats[task] = dict(pool=0 if pool is None else len(pool), plus=0 if h_plus is None else len(h_plus),
                                       minus=0 if h_minus is None else len(h_minus))
             if h_plus is not None:
@@ -209,8 +214,16 @@ def main():
                 proto = torch.stack([local_success_prototypes(h_minus[:, s].to(device), pool[:, s].to(device), args.k_nn).cpu()
                                      for s in range(steps)], dim=1)
                 minus[task], protos[task] = h_minus.flatten(0, 1), proto.flatten(0, 1)
-                gaps[task] = [prototype_distance_gap(h_minus[:, s].to(device), pool[:, s].to(device), args.k_nn)
-                              for s in range(steps)]
+                gaps_all[task] = [prototype_distance_gap(h_minus[:, s].to(device), pool[:, s].to(device), args.k_nn)
+                                  for s in range(steps)]
+                # The margin is calibrated on the states right after the onset (where a patch should act);
+                # H- itself still holds the onset chunk and every later one, as in the paper.
+                early = torch.from_numpy(onset_offset < args.margin_onset_chunks) if args.margin_onset_chunks > 0 else None
+                if early is not None and early.any():
+                    gaps[task] = [prototype_distance_gap(h_minus[early, s].to(device), pool[:, s].to(device), args.k_nn)
+                                  for s in range(steps)]
+                else:
+                    gaps[task] = gaps_all[task]
         print(f"[train] deployment buffer chunks: {buffer_stats}", flush=True)
     geometry, task_margins = {}, {}
     if gaps:
@@ -222,8 +235,11 @@ def main():
         for task in gaps:
             t_fail = float(np.mean([g[0] for g in gaps[task]]))
             t_succ = float(np.mean([g[1] for g in gaps[task]]))
-            geometry.setdefault("per_task", {})[task] = dict(dist_fail_to_prototype=t_fail, dist_success_to_prototype=t_succ,
-                                                             gap=t_fail - t_succ)
+            all_fail = float(np.mean([g[0] for g in gaps_all[task]]))
+            geometry.setdefault("per_task", {})[task] = dict(
+                dist_fail_to_prototype=t_fail, dist_success_to_prototype=t_succ, gap=t_fail - t_succ,
+                margin_onset_chunks=args.margin_onset_chunks, dist_all_h_minus_to_prototype=all_fail,
+                gap_all_h_minus=all_fail - t_succ)
             if args.margins == "task":
                 m = max(1e-4, args.margin_fraction * (t_fail - t_succ))
                 task_margins[task] = dict(null=m, redirect=m)
