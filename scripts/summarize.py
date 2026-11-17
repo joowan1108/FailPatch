@@ -62,7 +62,7 @@ def main():
               "annotator", "collect (h)"]
     rows = []
     for model_dir in models:
-        for task_dir in sorted(p for p in model_dir.iterdir() if p.is_dir() and not p.name.startswith("reb_")):
+        for task_dir in sorted(p for p in model_dir.iterdir() if p.is_dir() and not p.name.startswith("reb_") and p.name != "features"):
             base = load(task_dir / "eval_base.json")
             meta, labels = load(task_dir / "buffer_meta.json") or {}, load(task_dir / "labels.json") or {}
             times = tsv(task_dir / "stage_times.tsv")
