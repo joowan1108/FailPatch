@@ -64,7 +64,7 @@ VLA 는 전부 얼리고, 액션 헤드 직전에 **Null-gated Residual Expert B
 | 항목 | 정의 |
 |---|---|
 | base SR / FailPatch SR | 같은 50개 시드(같은 장면)에서 원본 정책과 보정 모듈을 붙인 정책의 성공률 |
-| SFT time (s) | 시연 특징 추출 + 프로토타입 계산 + 수렴할 때까지의 최적화(검증 평가 포함)의 벽시계 시간 (모델 로딩, 버퍼 수집, 주석 제외 — 각각 따로 기록). 스텝 수와 멈춘 이유를 같이 적음 |
+| SFT time (s) | 시연 특징 추출 + 프로토타입 계산 + 수렴할 때까지의 최적화(모니터링 평가 포함)의 벽시계 시간 (모델 로딩, 버퍼 수집, 주석 제외 — 각각 따로 기록). 스텝 수와 멈춘 이유를 같이 적음 |
 | GPU / GPU hours | `nvidia-smi` 의 GPU 이름과, SFT 에 쓴 시간·파이프라인 전체에 쓴 시간. 예: `SFT took 1800 s = 0.50 h on 1x NVIDIA GeForce RTX 4090` |
 | mean GPU util / peak memory | 10초 간격으로 기록한 값 |
 | patched chunks % | 평가 중 Null 이 아닌 경로가 선택된 청크 비율 |
