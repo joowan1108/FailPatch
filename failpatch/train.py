@@ -76,6 +76,11 @@ def main():
     parser.add_argument("--demos", required=True, help="directory with demos_<task>.npz")
     parser.add_argument("--out", required=True)
     parser.add_argument("--draws", type=int, default=16)
+    parser.add_argument("--center-features", default="none", choices=("none", "task"),
+                        help="task: subtract the per-task, per-denoising-step mean of the deployment representations "
+                             "before l2-normalising them for prototype retrieval and Redirect distances (about 90%% of "
+                             "|h|^2 of XR-1 lies along that shared direction, which compresses all normalised "
+                             "distances). none: the paper's space (normalise only)")
     parser.add_argument("--demo-target", default="draw", choices=("draw", "scene"),
                         help="draw: responsibilities from each (noise, time) draw, as in eq. 6-7. scene: from the "
                              "loss averaged over the cached draws of the same demonstration sample")
@@ -238,7 +243,7 @@ def main():
 
     # ---- deployment buffer: H+, H- and local success prototypes -------------------------
     tic = time.time()
-    plus, minus, protos, buffer_stats, gaps, gaps_all = {}, {}, {}, {}, {}, {}
+    plus, minus, protos, buffer_stats, gaps, gaps_all, centers = {}, {}, {}, {}, {}, {}, {}
     if not args.demo_only:
         for task in args.tasks:
             pool, h_plus, h_minus, onset_offset = load_buffer(Path(args.results) / task)
@@ -249,16 +254,23 @@ def main():
             if h_minus is not None and pool is not None:
                 # prototypes are retrieved among representations of the same denoising step
                 steps = h_minus.shape[1]
-                proto = torch.stack([local_success_prototypes(h_minus[:, s].to(device), pool[:, s].to(device), args.k_nn).cpu()
+                if args.center_features == "task":
+                    allh = torch.cat([x for x in (h_plus, h_minus) if x is not None])
+                    mu = allh.mean(dim=0)  # (S, d): one mean per denoising step
+                else:
+                    mu = torch.zeros(h_minus.shape[1:])
+                c_minus, c_pool = h_minus - mu, pool - mu
+                proto = torch.stack([local_success_prototypes(c_minus[:, s].to(device), c_pool[:, s].to(device), args.k_nn).cpu()
                                      for s in range(steps)], dim=1)
                 minus[task], protos[task] = h_minus.flatten(0, 1), proto.flatten(0, 1)
-                gaps_all[task] = [prototype_distance_gap(h_minus[:, s].to(device), pool[:, s].to(device), args.k_nn)
+                centers[task] = mu[None].expand(len(h_minus), -1, -1).flatten(0, 1).half()
+                gaps_all[task] = [prototype_distance_gap(c_minus[:, s].to(device), c_pool[:, s].to(device), args.k_nn)
                                   for s in range(steps)]
                 # The margin is calibrated on the states right after the onset (where a patch should act);
                 # H- itself still holds the onset chunk and every later one, as in the paper.
                 early = torch.from_numpy(onset_offset < args.margin_onset_chunks) if args.margin_onset_chunks > 0 else None
                 if early is not None and early.any():
-                    gaps[task] = [prototype_distance_gap(h_minus[early, s].to(device), pool[:, s].to(device), args.k_nn)
+                    gaps[task] = [prototype_distance_gap(c_minus[early, s].to(device), c_pool[:, s].to(device), args.k_nn)
                                   for s in range(steps)]
                 else:
                     gaps[task] = gaps_all[task]
@@ -375,7 +387,8 @@ def main():
     minus_store = {t: (minus[t], protos[t],
                        torch.full((len(minus[t]),), task_margins[t]["null"] if t in task_margins else args.null_margin),
                        torch.full((len(minus[t]),), task_margins[t]["redirect"] if t in task_margins else args.redirect_margin),
-                       torch.full((len(minus[t]),), task_margins[t]["temperature"] if t in task_margins else args.fail_temperature))
+                       torch.full((len(minus[t]),), task_margins[t]["temperature"] if t in task_margins else args.fail_temperature),
+                       centers[t])
                    for t in minus}
 
     # fixed validation subsets of the deployment buffer (the same rows at every evaluation)
@@ -413,10 +426,10 @@ def main():
                 add(task, "preserve", preserve_loss(reb, h, scale), len(h))
                 add(task, "null_top1_plus", (reb.log_probs(h).argmax(dim=1) == 0).float().mean(), len(h))
         for task, item in val_minus.items():
-            for h, proto, m_null, m_red, t_fail in chunks(item):
+            for h, proto, m_null, m_red, t_fail, ctr in chunks(item):
                 l_r, l_t, st = redirect_trust_loss(reb, h, proto, args.lambda_u, t_fail, m_null,
                                                    args.redirect_margin_weight, m_red, scale,
-                                                   bootstrap=args.redirect_bootstrap)
+                                                   bootstrap=args.redirect_bootstrap, center=ctr)
                 add(task, "redirect", l_r, len(h)); add(task, "trust", l_t, len(h))
                 for k in ("redirect_null_target", "progress_best", "energy_best"):
                     add(task, k, st[k], len(h))
@@ -474,10 +487,10 @@ def main():
             loss = loss + args.lambda_p * l_p
             stats["preserve"] = float(l_p)
         if minus_store:
-            h, proto, m_null, m_red, t_fail = sample(minus_store, args.batch_size)
+            h, proto, m_null, m_red, t_fail, ctr = sample(minus_store, args.batch_size)
             l_r, l_t, extra = redirect_trust_loss(reb, h, proto, args.lambda_u, t_fail,
                                                   m_null, args.redirect_margin_weight, m_red, scale,
-                                                  bootstrap=args.redirect_bootstrap)
+                                                  bootstrap=args.redirect_bootstrap, center=ctr)
             loss = loss + args.lambda_r * l_r + args.lambda_t * l_t
             stats.update(redirect=float(l_r), trust=float(l_t), **extra)
         lr = learning_rate(step)

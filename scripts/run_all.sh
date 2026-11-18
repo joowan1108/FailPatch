@@ -55,6 +55,8 @@ case "$VARIANT" in
     adapted_sum_d5k) VARIANT_ARGS="--action-loss sum --margins task --margin-onset-chunks 5 --fail-temperature-scaling margin" ;;
     # adapted_sum_d5k with responsibilities from the loss averaged over the draws of each scene
     adapted_sum_d5k_scene) VARIANT_ARGS="--action-loss sum --margins task --margin-onset-chunks 5 --fail-temperature-scaling margin --demo-target scene" ;;
+    # ... plus prototype retrieval and Redirect distances measured after removing the shared mean direction
+    adapted_sum_d5k_center) VARIANT_ARGS="--action-loss sum --margins task --margin-onset-chunks 5 --fail-temperature-scaling margin --demo-target scene --center-features task" ;;
     *) echo "unknown VARIANT $VARIANT" >&2; exit 1 ;;
 esac
 

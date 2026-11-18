@@ -122,7 +122,7 @@ def preserve_loss(reb, h, scale: float = 1.0):
 
 
 def redirect_trust_loss(reb, h, proto, lambda_u, temperature, null_margin, lambda_r, margin_r, scale: float = 1.0,
-                        bootstrap: bool = False):
+                        bootstrap: bool = False, center: torch.Tensor | None = None):
     """Failure-associated states H-: route to experts that move the representation toward the
     local success prototype (eqs. 11-13) with bounded intervention (eq. 14).
 
@@ -134,7 +134,9 @@ def redirect_trust_loss(reb, h, proto, lambda_u, temperature, null_margin, lambd
         margin_r = margin_r.to(h.device)[:, None]
     if torch.is_tensor(temperature):  # per-row (task) routing temperature
         temperature = temperature.to(h.device)[:, None]
-    dist = lambda x: (F.normalize(x, dim=-1) - proto).norm(dim=-1)  # noqa: E731
+    # center: (B, d) mean representation subtracted before normalising (None = the paper's space)
+    shift = center.to(h.device) if center is not None else 0.0
+    dist = lambda x: (F.normalize(x - shift, dim=-1) - proto).norm(dim=-1)  # noqa: E731
     deltas = reb.deltas(h)  # (K, B, d)
     energy = (deltas / scale).pow(2).sum(dim=-1).transpose(0, 1)  # (B, K)
     progress = dist(h)[:, None] - dist(h[None] + deltas).transpose(0, 1)  # (B, K)
