@@ -76,6 +76,8 @@ def main():
     parser.add_argument("--demos", required=True, help="directory with demos_<task>.npz")
     parser.add_argument("--out", required=True)
     parser.add_argument("--draws", type=int, default=16)
+    parser.add_argument("--demo-samples", type=int, default=0,
+                        help="use this many evenly spaced samples of each demos_<task>.npz (0 = all of them)")
     parser.add_argument("--feature-cache", default=None,
                         help="directory to store/reuse the frozen demonstration features across variants")
     parser.add_argument("--schedule", default="converge", choices=("converge", "fixed"))
@@ -155,8 +157,18 @@ def main():
     demo = {}
     cache_dir = Path(args.feature_cache) if args.feature_cache else None
     feature_cache_hits = 0
+
+    def demo_index(task: str) -> np.ndarray:
+        """Indices of the demonstration samples used (evenly spaced, so every demonstration is kept)."""
+        n = len(np.load(Path(args.demos) / f"demos_{task}.npz")["episode_ids"])
+        if args.demo_samples <= 0 or args.demo_samples >= n:
+            return np.arange(n)
+        return np.unique(np.linspace(0, n - 1, args.demo_samples).round().astype(int))
+
+    demo_idx = {task: demo_index(task) for task in args.tasks}
+    suffix = f"_n{args.demo_samples}" if args.demo_samples > 0 else ""
     for task in args.tasks:
-        cache_file = cache_dir / f"demo_features_{task}_draws{args.draws}.pt" if cache_dir else None
+        cache_file = cache_dir / f"demo_features_{task}_draws{args.draws}{suffix}.pt" if cache_dir else None
         if cache_file is not None and cache_file.exists():
             # The frozen features do not depend on the training variant, so variants share them.
             demo[task] = torch.load(cache_file)
@@ -169,7 +181,7 @@ def main():
         frame_keys = [k for k in data.files if k.startswith(("video.", "state."))]
         arrays = {k: data[k] for k in frame_keys}
         zs, targets, masks = [], [], []
-        for i in range(len(data["actions"])):
+        for n_done, i in enumerate(demo_idx[task]):
             sample = {
                 "frames": [{k: arrays[k][i, j] for k in frame_keys} for j in range(len(adapter.frame_deltas))],
                 "instruction": str(data["instructions"][i]),
@@ -179,8 +191,8 @@ def main():
             zs.append(z.half())
             targets.append(target)
             masks.append(mask)
-            if i % 100 == 0:
-                print(f"[train] features {task}: {i}/{len(data['actions'])} ({time.time() - tic:.0f}s)", flush=True)
+            if n_done % 100 == 0:
+                print(f"[train] features {task}: {n_done}/{len(demo_idx[task])} ({time.time() - tic:.0f}s)", flush=True)
         demo[task] = (torch.cat(zs), torch.cat(targets), torch.cat(masks))
         if cache_file is not None:
             cache_dir.mkdir(parents=True, exist_ok=True)
@@ -198,7 +210,7 @@ def main():
     if args.schedule == "converge":
         for task in args.tasks:
             z, target, mask = demo[task]
-            episode_ids = np.load(Path(args.demos) / f"demos_{task}.npz")["episode_ids"]
+            episode_ids = np.load(Path(args.demos) / f"demos_{task}.npz")["episode_ids"][demo_idx[task]]
             if len(z) != len(episode_ids) * args.draws:
                 raise RuntimeError(f"{task}: {len(z)} feature rows != {len(episode_ids)} samples x {args.draws} draws")
             first = torch.from_numpy(np.tile(np.arange(args.draws) < args.val_draws, len(episode_ids)))

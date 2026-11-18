@@ -50,6 +50,9 @@ case "$VARIANT" in
     paper)       VARIANT_ARGS="--action-loss sum" ;;
     adapted)     VARIANT_ARGS="--action-loss mean --margins relative --redirect-bootstrap --redirect-margin-weight 1.0" ;;
     adapted_sum) VARIANT_ARGS="--action-loss sum --margins task --margin-onset-chunks 5 --fail-temperature-scaling margin" ;;
+    # same objective as adapted_sum, trained on the larger demonstration set (run with
+    # DEMO_DIR=demos_5k FEATURE_DIR=features_5k); a separate name keeps the earlier results
+    adapted_sum_d5k) VARIANT_ARGS="--action-loss sum --margins task --margin-onset-chunks 5 --fail-temperature-scaling margin" ;;
     *) echo "unknown VARIANT $VARIANT" >&2; exit 1 ;;
 esac
 
