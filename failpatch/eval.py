@@ -27,11 +27,11 @@ def main():
     episodes: list[dict] = []
     tic = time.time()
     try:
-        run_episodes(pool, policy, exec_steps, lambda: next(seeds, None), episodes.append)
+        run_episodes(pool, policy, exec_steps, lambda: next(seeds, None), episodes.append, fixed_noise=args.fixed_noise)
     finally:
         pool.close()
     result = summarize(episodes)
-    result.update(model=args.model, task=args.task, split=args.split, layout=args.layout, style=args.style, tag=tag, horizon=pool.horizon,
+    result.update(model=args.model, task=args.task, split=args.split, layout=args.layout, style=args.style, fixed_noise=args.fixed_noise, tag=tag, horizon=pool.horizon,
                   exec_steps=exec_steps, eval_wall_time_s=time.time() - tic,
                   mean_vla_latency_s=policy.infer_time / max(1, policy.n_queries))
     out = Path(args.out_dir)

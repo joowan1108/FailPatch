@@ -32,6 +32,15 @@ ACTION_KEYS = ["end_effector_position", "end_effector_rotation", "gripper_close"
 ACTION_DIMS = [3, 3, 1, 4, 1]
 
 
+def seed_everything(seed: int) -> None:
+    """Seed every RNG the policy's inference may draw from (torch CPU/CUDA, numpy, random)."""
+    import random
+
+    random.seed(seed)
+    np.random.seed(seed % 2**32)
+    torch.manual_seed(seed)
+
+
 class HiddenHook:
     """forward_pre_hook on the action projection: records the action-token hidden states and,
     when a REB is attached, replaces them with the patched ones."""
@@ -138,9 +147,11 @@ class XR1Adapter:
         return self.client.infer(states, images, obs["instruction"])
 
     # -- interface -----------------------------------------------------------------------
-    def act(self, obs_list, reset, session_ids):
+    def act(self, obs_list, reset, session_ids, noise_seeds=None):
         actions, hidden, routes = [], [], []
-        for obs in obs_list:
+        for j, obs in enumerate(obs_list):
+            if noise_seeds is not None:  # one query at a time, so each one gets its own sampling seed
+                seed_everything(noise_seeds[j])
             with self.hook.running("infer"):
                 actions.append(self._infer_one(obs))
                 h, r = self.hook.result()
@@ -234,7 +245,9 @@ class RLDXAdapter:
     def _state(self, obs, key):
         return np.stack([np.asarray(obs["frames"][j][f"state.{key}"], np.float32).reshape(-1) for j in self.state_idx])
 
-    def act(self, obs_list, reset, session_ids):
+    def act(self, obs_list, reset, session_ids, noise_seeds=None):
+        if noise_seeds is not None:
+            raise NotImplementedError("fixed noise: RLDX-1 samples the whole batch with one call")
         observation = {f"video.{k}": np.stack([self._video(o, k) for o in obs_list]) for k in self.video_keys}
         observation.update({f"state.{k}": np.stack([self._state(o, k) for o in obs_list]) for k in self.state_keys})
         observation[self.language_key] = [str(o["instruction"]) for o in obs_list]

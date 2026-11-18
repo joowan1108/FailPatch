@@ -52,7 +52,8 @@ def main():
         if request["cmd"] != "act":
             raise ValueError(f"unknown cmd {request['cmd']!r}")
         tic = time.time()
-        actions, hidden, routes = adapter.act(request["obs"], request["reset"], request["session_ids"])
+        actions, hidden, routes = adapter.act(request["obs"], request["reset"], request["session_ids"],
+                                              noise_seeds=request.get("noise_seeds"))
         torch.cuda.synchronize()
         return {"actions": actions, "hidden": hidden, "routes": routes, "infer_time": time.time() - tic}
 

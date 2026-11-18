@@ -24,12 +24,15 @@ class Policy:
         self.default_exec_steps = int(self.info["default_exec_steps"])
         self.infer_time, self.n_queries = 0.0, 0
 
-    def act(self, obs, reset, session_ids):
-        response = self.rpc.call({
+    def act(self, obs, reset, session_ids, noise_seeds=None):
+        request = {
             "cmd": "act",
             "obs": [{"frames": o["frames"], "instruction": o["instruction"]} for o in obs],
             "reset": reset, "session_ids": session_ids,
-        })
+        }
+        if noise_seeds is not None:
+            request["noise_seeds"] = [int(s) for s in noise_seeds]
+        response = self.rpc.call(request)
         self.infer_time += float(response["infer_time"])
         self.n_queries += len(obs)
         return response["actions"], response["hidden"], response["routes"]
@@ -44,6 +47,10 @@ def add_common_args(parser) -> None:
     parser.add_argument("--layout", type=int, default=None,
                         help="fix the RoboCasa kitchen layout id (requires --style); objects still vary per seed")
     parser.add_argument("--style", type=int, default=None)
+    parser.add_argument("--fixed-noise", action="store_true",
+                        help="seed the policy's sampling (flow-matching initial noise) from (scene seed, chunk index), "
+                             "so two runs of the same policy on the same scenes act identically and a patched policy "
+                             "differs from the base only where the patch changes the actions")
     parser.add_argument("--n-envs", type=int, default=4)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--horizon", type=int, default=None, help="default: robocasa get_task_horizon")
@@ -63,11 +70,17 @@ def connect(args):
     return policy, pool, exec_steps
 
 
+def noise_seed(scene_seed: int, chunk: int) -> int:
+    """Sampling seed of one policy query: a function of the scene and the chunk index only."""
+    return (int(scene_seed) * 1_000_003 + int(chunk)) % (2**31 - 1)
+
+
 def run_episodes(pool: EnvPool, policy: Policy, exec_steps: int,
                  next_seed: Callable[[], int | None],
                  on_episode: Callable[[dict], None],
                  record: bool = False,
-                 stop: Callable[[], bool] = lambda: False) -> None:
+                 stop: Callable[[], bool] = lambda: False,
+                 fixed_noise: bool = False) -> None:
     """Runs episodes until `next_seed` is exhausted or `stop()` is true.
     With record=True each finished episode carries the per-chunk hidden representations,
     routes and the left agent-view frame observed when the chunk was queried."""
@@ -87,7 +100,10 @@ def run_episodes(pool: EnvPool, policy: Policy, exec_steps: int,
         if ready and not stop():
             ids = sorted(ready)
             obs = [ready.pop(i) for i in ids]
-            actions, hidden, routes = policy.act(obs, [episodes[i]["first"] for i in ids], [f"env{i}" for i in ids])
+            noise_seeds = ([noise_seed(episodes[i]["seed"], len(episodes[i]["routes"])) for i in ids]
+                           if fixed_noise else None)
+            actions, hidden, routes = policy.act(obs, [episodes[i]["first"] for i in ids], [f"env{i}" for i in ids],
+                                                 noise_seeds)
             for j, i in enumerate(ids):
                 ep = episodes[i]
                 ep["first"] = False
