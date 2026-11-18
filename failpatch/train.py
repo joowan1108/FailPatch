@@ -76,6 +76,9 @@ def main():
     parser.add_argument("--demos", required=True, help="directory with demos_<task>.npz")
     parser.add_argument("--out", required=True)
     parser.add_argument("--draws", type=int, default=16)
+    parser.add_argument("--redirect-balance", default="none", choices=("none", "null-vs-expert"),
+                        help="null-vs-expert: class-balance the Redirect routing CE over the groups Null and any "
+                             "residual expert (the paper's eq. 13 is a plain CE)")
     parser.add_argument("--center-features", default="none", choices=("none", "task"),
                         help="task: subtract the per-task, per-denoising-step mean of the deployment representations "
                              "before l2-normalising them for prototype retrieval and Redirect distances (about 90%% of "
@@ -429,7 +432,7 @@ def main():
             for h, proto, m_null, m_red, t_fail, ctr in chunks(item):
                 l_r, l_t, st = redirect_trust_loss(reb, h, proto, args.lambda_u, t_fail, m_null,
                                                    args.redirect_margin_weight, m_red, scale,
-                                                   bootstrap=args.redirect_bootstrap, center=ctr)
+                                                   bootstrap=args.redirect_bootstrap, center=ctr, balance=args.redirect_balance)
                 add(task, "redirect", l_r, len(h)); add(task, "trust", l_t, len(h))
                 for k in ("redirect_null_target", "progress_best", "energy_best"):
                     add(task, k, st[k], len(h))
@@ -490,7 +493,7 @@ def main():
             h, proto, m_null, m_red, t_fail, ctr = sample(minus_store, args.batch_size)
             l_r, l_t, extra = redirect_trust_loss(reb, h, proto, args.lambda_u, t_fail,
                                                   m_null, args.redirect_margin_weight, m_red, scale,
-                                                  bootstrap=args.redirect_bootstrap, center=ctr)
+                                                  bootstrap=args.redirect_bootstrap, center=ctr, balance=args.redirect_balance)
             loss = loss + args.lambda_r * l_r + args.lambda_t * l_t
             stats.update(redirect=float(l_r), trust=float(l_t), **extra)
         lr = learning_rate(step)

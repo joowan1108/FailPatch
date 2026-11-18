@@ -57,6 +57,9 @@ case "$VARIANT" in
     adapted_sum_d5k_scene) VARIANT_ARGS="--action-loss sum --margins task --margin-onset-chunks 5 --fail-temperature-scaling margin --demo-target scene" ;;
     # ... plus prototype retrieval and Redirect distances measured after removing the shared mean direction
     adapted_sum_d5k_center) VARIANT_ARGS="--action-loss sum --margins task --margin-onset-chunks 5 --fail-temperature-scaling margin --demo-target scene --center-features task" ;;
+    # centered distances, Redirect margin weight 1.0, demo routing weight 0.2, Redirect routing CE
+    # balanced over Null vs experts (the router followed the demo-routing pull before; see README)
+    k8_center_rd02_bal) VARIANT_ARGS="--action-loss sum --margins task --margin-onset-chunks 5 --fail-temperature-scaling margin --center-features task --redirect-margin-weight 1.0 --lambda-rd 0.2 --redirect-balance null-vs-expert" ;;
     *) echo "unknown VARIANT $VARIANT" >&2; exit 1 ;;
 esac
 

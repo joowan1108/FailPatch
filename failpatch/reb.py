@@ -122,7 +122,7 @@ def preserve_loss(reb, h, scale: float = 1.0):
 
 
 def redirect_trust_loss(reb, h, proto, lambda_u, temperature, null_margin, lambda_r, margin_r, scale: float = 1.0,
-                        bootstrap: bool = False, center: torch.Tensor | None = None):
+                        bootstrap: bool = False, center: torch.Tensor | None = None, balance: str = "none"):
     """Failure-associated states H-: route to experts that move the representation toward the
     local success prototype (eqs. 11-13) with bounded intervention (eq. 14).
 
@@ -145,7 +145,18 @@ def redirect_trust_loss(reb, h, proto, lambda_u, temperature, null_margin, lambd
         q0 = (utility.max(dim=1).values <= null_margin).float()
         q = torch.cat([q0[:, None], (1 - q0)[:, None] * F.softmax(utility / temperature, dim=1)], dim=1)
     log_p = reb.log_probs(h)
-    route_ce = -(q * log_p).sum(dim=1)
+    if balance == "null-vs-expert":
+        # Class balancing over two groups, Null and "any residual expert": each group's rows get a weight
+        # inversely proportional to its share of the batch target mass, so the few H- states whose
+        # target is an expert are not drowned out by the Null majority (eq. 13 uses a plain CE).
+        mass_null, mass_exp = q[:, 0].mean(), q[:, 1:].sum(dim=1).mean()
+        active = (mass_null > 0).float() + (mass_exp > 0).float()
+        w_null = torch.where(mass_null > 0, 1.0 / (mass_null * active).clamp_min(1e-8), torch.zeros_like(mass_null))
+        w_exp = torch.where(mass_exp > 0, 1.0 / (mass_exp * active).clamp_min(1e-8), torch.zeros_like(mass_exp))
+        weight = torch.cat([w_null[None], w_exp[None].expand(q.shape[1] - 1)])
+        route_ce = -(weight * q * log_p).sum(dim=1)
+    else:
+        route_ce = -(q * log_p).sum(dim=1)
     # Paper: the push is weighted by the utility target q_k, which is non-zero for every expert
     # (softmax of the utilities) on states where at least one expert clears the Null threshold,
     # and zero on all other states. If no expert ever clears it, the push never starts;
