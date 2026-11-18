@@ -25,6 +25,11 @@ N_FAIL="${N_FAIL:-50}"
 MAX_EPISODES="${MAX_EPISODES:-300}"
 NUM_DEMOS="${NUM_DEMOS:-50}"
 DEMO_SAMPLES="${DEMO_SAMPLES:-1000}"
+# Demonstration samples and their cached frozen features. The defaults are the first runs (1,000
+# anchor steps per task); DEMO_DIR=demos_5k / FEATURE_DIR=features_5k select the larger set that
+# keeps the experts from memorising a small fixed set of rows (see README).
+DEMO_DIR="${DEMO_DIR:-demos}"
+FEATURE_DIR="${FEATURE_DIR:-features}"
 # auto | openai | anthropic | heuristic | external (annotate on another machine so that the API key
 # never touches this instance; see scripts/annotate_local.sh)
 ANNOTATOR="${ANNOTATOR:-auto}"
@@ -101,15 +106,15 @@ stage() {
     printf '%s\t%s\n' "$name" "$((SECONDS - t0))" >> "$dir/stage_times.tsv"
 }
 
-mkdir -p "$RESULTS/demos"
+mkdir -p "$RESULTS/$DEMO_DIR"
 nvidia-smi -i "$GPU" --query-gpu=name,memory.total,driver_version --format=csv,noheader > "$RESULTS/gpu.txt"
 echo "[run] GPU $GPU: $(cat "$RESULTS/gpu.txt")"
 wait_for_download assets
 wait_for_download demos
 for task in $TASKS; do
-    if [[ ! -f $RESULTS/demos/demos_$task.npz ]]; then
-        stage "$RESULTS/demos" "prepare_$task" "$PY" -u -m failpatch.prepare_demos --task "$task" --split "$SPLIT" \
-            --out "$RESULTS/demos" --num-demos "$NUM_DEMOS" --samples "$DEMO_SAMPLES"
+    if [[ ! -f $RESULTS/$DEMO_DIR/demos_$task.npz ]]; then
+        stage "$RESULTS/$DEMO_DIR" "prepare_$task" "$PY" -u -m failpatch.prepare_demos --task "$task" --split "$SPLIT" \
+            --out "$RESULTS/$DEMO_DIR" --num-demos "$NUM_DEMOS" --samples "$DEMO_SAMPLES"
     fi
 done
 
@@ -160,8 +165,8 @@ for model in $MODELS; do
     if [[ ! -f $RESULTS/$model/reb_$VARIANT/reb.pt ]]; then
         # shellcheck disable=SC2086
         stage "$RESULTS/$model/reb_$VARIANT" train "$MODEL_PY" -u -m failpatch.train --model "$model" "${MODEL_ARGS[@]}" \
-            --tasks $TASKS --results "$RESULTS/$model" --demos "$RESULTS/demos" --out "$RESULTS/$model/reb_$VARIANT" \
-            --feature-cache "$RESULTS/$model/features" $VARIANT_ARGS $EXTRA_TRAIN_ARGS
+            --tasks $TASKS --results "$RESULTS/$model" --demos "$RESULTS/$DEMO_DIR" --out "$RESULTS/$model/reb_$VARIANT" \
+            --feature-cache "$RESULTS/$model/$FEATURE_DIR" $VARIANT_ARGS $EXTRA_TRAIN_ARGS
     fi
 
     # 5: evaluation with the REB attached
