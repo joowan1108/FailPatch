@@ -40,10 +40,22 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from failpatch.adapters import build
 from failpatch.reb import (ResidualExpertBank, demo_loss, local_success_prototypes, preserve_loss,
                            prototype_distance_gap, redirect_trust_loss)
+
+
+def load_pre_onset(task_dir: Path):
+    """-> (N, S, d) representations of the failed rollouts before their annotated onset: nominal states
+    that are not in the success-prototype pool (used to measure the experts' chance-level utility)."""
+    labels = json.loads((task_dir / "labels.json").read_text())
+    pre = []
+    for stem, lab in labels.items():
+        if not lab["success"] and lab["failure_onset_chunk"]:
+            pre.append(np.load(task_dir / "buffer" / f"{stem}.npz")["hidden"][: lab["failure_onset_chunk"]].astype(np.float32))
+    return torch.from_numpy(np.concatenate(pre)) if pre else None
 
 
 def load_buffer(task_dir: Path):
@@ -130,7 +142,13 @@ def main():
     parser.add_argument("--null-margin", type=float, default=0.1)
     parser.add_argument("--redirect-margin-weight", type=float, default=0.01)
     parser.add_argument("--redirect-margin", type=float, default=0.1)
-    parser.add_argument("--margins", default="paper", choices=("paper", "relative", "task"),
+    parser.add_argument("--noise-floor-quantile", type=float, default=0.95,
+                        help="--margins noise-floor: the margin of a task is this quantile of the best-expert "
+                             "utility on its nominal states (pre-onset chunks of failed rollouts)")
+    parser.add_argument("--margin-update-every", type=int, default=1000)
+    parser.add_argument("--margin-floor", type=float, default=1e-3)
+    parser.add_argument("--noise-floor-rows", type=int, default=4096, help="nominal rows per task used for the quantile")
+    parser.add_argument("--margins", default="paper", choices=("paper", "relative", "task", "noise-floor"),
                         help="paper: --null-margin / --redirect-margin as given (0.1). relative: both are set to "
                              "--margin-fraction of the measured gap between failure and success representations, "
                              "averaged over all tasks. task: the same, but measured and applied per task")
@@ -246,7 +264,7 @@ def main():
 
     # ---- deployment buffer: H+, H- and local success prototypes -------------------------
     tic = time.time()
-    plus, minus, protos, buffer_stats, gaps, gaps_all, centers = {}, {}, {}, {}, {}, {}, {}
+    plus, minus, protos, buffer_stats, gaps, gaps_all, centers, noise_store = {}, {}, {}, {}, {}, {}, {}, {}
     if not args.demo_only:
         for task in args.tasks:
             pool, h_plus, h_minus, onset_offset = load_buffer(Path(args.results) / task)
@@ -267,6 +285,15 @@ def main():
                                      for s in range(steps)], dim=1)
                 minus[task], protos[task] = h_minus.flatten(0, 1), proto.flatten(0, 1)
                 centers[task] = mu[None].expand(len(h_minus), -1, -1).flatten(0, 1).half()
+                if args.margins == "noise-floor":
+                    pre = load_pre_onset(Path(args.results) / task)
+                    if pre is not None:
+                        c_pre = pre - mu
+                        pre_proto = torch.stack([local_success_prototypes(c_pre[:, s].to(device), c_pool[:, s].to(device), args.k_nn).cpu()
+                                                 for s in range(steps)], dim=1)
+                        rows = torch.randperm(len(pre) * steps, generator=torch.Generator().manual_seed(args.seed))[: args.noise_floor_rows]
+                        noise_store[task] = (pre.flatten(0, 1)[rows], pre_proto.flatten(0, 1)[rows],
+                                             mu[None].expand(len(pre), -1, -1).flatten(0, 1)[rows])
                 gaps_all[task] = [prototype_distance_gap(c_minus[:, s].to(device), c_pool[:, s].to(device), args.k_nn)
                                   for s in range(steps)]
                 # The margin is calibrated on the states right after the onset (where a patch should act);
@@ -296,6 +323,8 @@ def main():
             if args.margins == "task":
                 m = max(1e-4, args.margin_fraction * (t_fail - t_succ))
                 task_margins[task] = dict(null=m, redirect=m)
+            elif args.margins == "noise-floor":  # set from the experts' utility during training
+                task_margins[task] = dict(null=args.margin_floor, redirect=args.margin_floor)
             else:
                 task_margins[task] = dict(null=args.null_margin, redirect=args.redirect_margin)
             task_margins[task]["temperature"] = (
@@ -403,6 +432,35 @@ def main():
         idx = pick(len(minus_store[t][0]))
         val_minus[t] = tuple(x[idx] for x in minus_store[t])
 
+    margin_history = []
+
+    @torch.no_grad()
+    def update_noise_floor_margins(step: int):
+        """Margin of each task = quantile of the best-expert utility on its nominal states, i.e. the
+        progress the current experts reach on states that need no correction; temperatures follow."""
+        if args.margins != "noise-floor":
+            return
+        record = {"step": step}
+        for t, (h, proto, ctr) in noise_store.items():
+            us = []
+            for i in range(0, len(h), 1024):
+                hh, pp, cc = h[i:i + 1024].to(device).float(), proto[i:i + 1024].to(device).float(), ctr[i:i + 1024].to(device).float()
+                dist = lambda x: (F.normalize(x - cc, dim=-1) - pp).norm(dim=-1)  # noqa: E731
+                d = reb.deltas(hh)
+                energy = (d / scale).pow(2).sum(dim=-1).transpose(0, 1)
+                progress = dist(hh)[:, None] - dist(hh[None] + d).transpose(0, 1)
+                us.append((progress - args.lambda_u * energy).max(dim=1).values.cpu())
+            m = max(args.margin_floor, float(torch.quantile(torch.cat(us), args.noise_floor_quantile)))
+            temp = args.fail_temperature * m / args.reference_margin if args.fail_temperature_scaling == "margin" else args.fail_temperature
+            task_margins[t].update(null=m, redirect=m, temperature=temp)
+            for store in (minus_store, val_minus):
+                if t in store:
+                    store[t][2].fill_(m); store[t][3].fill_(m); store[t][4].fill_(temp)
+            record[t] = round(m, 5)
+        margin_history.append(record)
+        if step % 5000 == 0 or step <= 1:
+            print(f"[train] noise-floor margins at step {step}: {record}", flush=True)
+
     def chunks(item, size=256):
         first = item[0] if isinstance(item, tuple) else item
         for i in range(0, len(first), size):
@@ -478,6 +536,8 @@ def main():
     step = 0
     while True:
         step += 1
+        if step == 1 or step % args.margin_update_every == 0:
+            update_noise_floor_margins(step)
         temperature = temperature_at(step)
         z, target, mask = sample_scenes(demo, args.batch_size) if args.demo_target == "scene" else sample(demo, args.batch_size)
         l_expert, l_router, stats = demo_loss(reb, z, target, mask, adapter.project, temperature,
@@ -539,7 +599,8 @@ def main():
                                  reason="converged" if done else "max_steps", converged_at=step if done else None)
                     print(f"[train] {decay['reason']} at step {step} ({info}); learning-rate decay over "
                           f"{decay['length']} steps", flush=True)
-            val_log.write(json.dumps(dict(step=step, lr=lr, temperature=temperature, **metrics, **info)) + "\n")
+            mrg = {f"margin_{t}": v["null"] for t, v in task_margins.items()} if args.margins == "noise-floor" else {}
+            val_log.write(json.dumps(dict(step=step, lr=lr, temperature=temperature, **metrics, **info, **mrg)) + "\n")
             val_log.flush()
             print("[val] step=%d %s" % (step, " ".join(f"{k[4:]}={v:.4g}" for k, v in metrics.items())), flush=True)
     final_val = evaluate() if converge else {}
@@ -557,7 +618,7 @@ def main():
         model_load_s=load_s, steps=step, schedule=args.schedule, stop_reason=decay["reason"],
         converged_at_step=decay.get("converged_at"), decay_start_step=decay["start"], decay_steps=decay["length"],
         evaluation_s=eval_s, validation=val_info, final_val=final_val, best_val_objective=best["objective"] if best["step"] is not None else None,
-        best_val_step=best["step"], demo_draws=n_draws,
+        best_val_step=best["step"], margin_history=margin_history, demo_draws=n_draws,
         trainable_params=n_params, trainable_fraction=n_params / vla_params,
         buffer_chunks=buffer_stats, energy_scale=scale, geometry=geometry, action_loss=args.action_loss,
         margins=args.margins, null_margin=args.null_margin, redirect_margin=args.redirect_margin, task_margins=task_margins,

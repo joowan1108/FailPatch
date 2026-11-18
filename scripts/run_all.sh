@@ -60,6 +60,9 @@ case "$VARIANT" in
     # centered distances, Redirect margin weight 1.0, demo routing weight 0.2, Redirect routing CE
     # balanced over Null vs experts (the router followed the demo-routing pull before; see README)
     k8_center_rd02_bal) VARIANT_ARGS="--action-loss sum --margins task --margin-onset-chunks 5 --fail-temperature-scaling margin --center-features task --redirect-margin-weight 1.0 --lambda-rd 0.2 --redirect-balance null-vs-expert" ;;
+    # ... with the Redirect margin of every task set, every 1k steps, to the 95th percentile of the
+    # experts' utility on nominal states (pre-onset chunks of failed rollouts): chance-level progress
+    k8_center_rd02_bal_nf) VARIANT_ARGS="--action-loss sum --margins noise-floor --fail-temperature-scaling margin --center-features task --redirect-margin-weight 1.0 --lambda-rd 0.2 --redirect-balance null-vs-expert" ;;
     *) echo "unknown VARIANT $VARIANT" >&2; exit 1 ;;
 esac
 
