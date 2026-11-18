@@ -31,7 +31,7 @@ def main():
     finally:
         pool.close()
     result = summarize(episodes)
-    result.update(model=args.model, task=args.task, split=args.split, tag=tag, horizon=pool.horizon,
+    result.update(model=args.model, task=args.task, split=args.split, layout=args.layout, style=args.style, tag=tag, horizon=pool.horizon,
                   exec_steps=exec_steps, eval_wall_time_s=time.time() - tic,
                   mean_vla_latency_s=policy.infer_time / max(1, policy.n_queries))
     out = Path(args.out_dir)

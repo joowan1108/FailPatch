@@ -41,6 +41,9 @@ def add_common_args(parser) -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=10086)
     parser.add_argument("--split", default="pretrain", choices=("pretrain", "target"))
+    parser.add_argument("--layout", type=int, default=None,
+                        help="fix the RoboCasa kitchen layout id (requires --style); objects still vary per seed")
+    parser.add_argument("--style", type=int, default=None)
     parser.add_argument("--n-envs", type=int, default=4)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--horizon", type=int, default=None, help="default: robocasa get_task_horizon")
@@ -53,8 +56,10 @@ def connect(args):
     if policy.name != args.model:
         raise RuntimeError(f"server on port {args.port} serves {policy.name!r}, not {args.model!r}")
     exec_steps = args.exec_steps or policy.default_exec_steps
+    if (args.layout is None) != (args.style is None):
+        raise SystemExit("--layout and --style go together")
     pool = EnvPool(n_envs=args.n_envs, task=args.task, split=args.split, seed=args.seed,
-                   frame_deltas=policy.frame_deltas, horizon=args.horizon)
+                   frame_deltas=policy.frame_deltas, horizon=args.horizon, layout=args.layout, style=args.style)
     return policy, pool, exec_steps
 
 

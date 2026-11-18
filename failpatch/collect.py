@@ -65,7 +65,7 @@ def main():
         run_episodes(pool, policy, exec_steps, next_seed, on_episode, record=True, stop=done)
     finally:
         pool.close()
-    meta = dict(model=args.model, task=args.task, split=args.split, exec_steps=exec_steps,
+    meta = dict(model=args.model, task=args.task, split=args.split, layout=args.layout, style=args.style, exec_steps=exec_steps,
                 n_success=counts[True], n_fail=counts[False], episodes_run=state["finished"],
                 collect_wall_time_s=time.time() - tic)
     (Path(args.out_dir) / "buffer_meta.json").write_text(json.dumps(meta, indent=2))

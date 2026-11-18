@@ -46,7 +46,13 @@ def _worker(conn, cfg: dict) -> None:
         from robocasa.utils.env_utils import convert_action
 
         task = cfg["task"]
-        env = gym.make(f"robocasa/{task}", split=cfg["split"], seed=cfg["seed"])
+        if cfg.get("layout") is not None:
+            # One fixed kitchen (layout and style); objects are still sampled per seed. The split then
+            # only selects object instances (create_env would otherwise override the layout ids).
+            env = gym.make(f"robocasa/{task}", split=None, obj_instance_split=cfg["split"], seed=cfg["seed"],
+                           layout_ids=cfg["layout"], style_ids=cfg["style"])
+        else:
+            env = gym.make(f"robocasa/{task}", split=cfg["split"], seed=cfg["seed"])
         horizon = cfg["horizon"] or int(get_task_horizon(task))
         deltas = cfg["frame_deltas"]
         size = cfg["rl_image_size"]
@@ -125,6 +131,8 @@ class EnvPool:
         frame_deltas: list[int],
         horizon: int | None = None,
         rl_image_size: int = 64,
+        layout: int | None = None,
+        style: int | None = None,
     ):
         ctx = mp.get_context("spawn")  # EGL contexts do not survive fork
         self.n = n_envs
@@ -134,6 +142,8 @@ class EnvPool:
             cfg = dict(
                 task=task,
                 split=split,
+                layout=layout,
+                style=style,
                 seed=seed + i,
                 horizon=horizon,
                 frame_deltas=frame_deltas,
