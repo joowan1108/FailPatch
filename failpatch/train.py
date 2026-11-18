@@ -76,6 +76,9 @@ def main():
     parser.add_argument("--demos", required=True, help="directory with demos_<task>.npz")
     parser.add_argument("--out", required=True)
     parser.add_argument("--draws", type=int, default=16)
+    parser.add_argument("--demo-target", default="draw", choices=("draw", "scene"),
+                        help="draw: responsibilities from each (noise, time) draw, as in eq. 6-7. scene: from the "
+                             "loss averaged over the cached draws of the same demonstration sample")
     parser.add_argument("--demo-samples", type=int, default=0,
                         help="use this many evenly spaced samples of each demos_<task>.npz (0 = all of them)")
     parser.add_argument("--feature-cache", default=None,
@@ -336,6 +339,23 @@ def main():
     for p in adapter.model.parameters():
         p.requires_grad_(False)
 
+    def sample_scenes(store: dict, n: int):
+        """Task-balanced batch of whole demonstration samples: n // draws samples, all their draws
+        (rows are stored sample by sample, `--draws` rows each)."""
+        g = args.draws
+        tasks = list(store)
+        picks = [tasks[i % len(tasks)] for i in torch.randperm(max(1, n // g)).tolist()]
+        parts = []
+        for task in tasks:
+            count = picks.count(task)
+            if count == 0:
+                continue
+            z, target, mask = store[task]
+            scenes = torch.randint(0, len(z) // g, (count,))
+            rows = (scenes[:, None] * g + torch.arange(g)).reshape(-1)
+            parts.append((z[rows], target[rows], mask[rows]))
+        return tuple(torch.cat(col).to(device).float() for col in zip(*parts))
+
     def sample(store: dict, n: int):
         """Task-balanced minibatch from {task: tensor or tuple of tensors}."""
         tasks = list(store)
@@ -383,7 +403,8 @@ def main():
 
         for task, item in val_demo.items():
             for z, target, mask in chunks(item):
-                l_e, l_r, st = demo_loss(reb, z, target, mask, adapter.project, 0.2, True, reduction=args.action_loss)
+                l_e, l_r, st = demo_loss(reb, z, target, mask, adapter.project, 0.2, True, reduction=args.action_loss,
+                                         group=args.val_draws if args.demo_target == "scene" else 1)
                 add(task, "demo_expert", l_e, len(z)); add(task, "demo_router", l_r, len(z))
                 for k in ("loss_best", "loss_null", "demo_null_target"):
                     add(task, "demo_" + k.replace("demo_", ""), st[k], len(z))
@@ -442,9 +463,10 @@ def main():
     while True:
         step += 1
         temperature = temperature_at(step)
-        z, target, mask = sample(demo, args.batch_size)
+        z, target, mask = sample_scenes(demo, args.batch_size) if args.demo_target == "scene" else sample(demo, args.batch_size)
         l_expert, l_router, stats = demo_loss(reb, z, target, mask, adapter.project, temperature,
-                                              null_enabled=step > args.warmup_steps, reduction=args.action_loss)
+                                              null_enabled=step > args.warmup_steps, reduction=args.action_loss,
+                                              group=args.draws if args.demo_target == "scene" else 1)
         loss = l_expert + args.lambda_rd * l_router
         stats.update(expert=float(l_expert), router_demo=float(l_router))
         if plus:

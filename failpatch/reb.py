@@ -69,7 +69,8 @@ def _balanced_soft_ce(target: torch.Tensor, log_p: torch.Tensor) -> torch.Tensor
     return -(weight * target * log_p).sum(dim=-1).mean()
 
 
-def demo_loss(reb, z, target, mask, project, temperature: float, null_enabled: bool, reduction: str = "sum"):
+def demo_loss(reb, z, target, mask, project, temperature: float, null_enabled: bool, reduction: str = "sum",
+              group: int = 1):
     """Action-grounded patch learning on successful demonstrations (eqs. 6-9).
 
     z (B, T, d) frozen action-token hidden states, target (B, T, A) flow-matching target,
@@ -79,6 +80,12 @@ def demo_loss(reb, z, target, mask, project, temperature: float, null_enabled: b
     "mean" divides by the number of valid entries; the losses are then ~200x smaller than the
     temperature T_d (1.0 -> 0.2), every expert gets the same responsibility and the experts
     collapse onto one another (observed: pairwise cosine 0.7-0.8 after training).
+
+    group > 1: the batch holds `group` consecutive (noise, time) draws of the same demonstration
+    sample. Responsibilities w_k and the Null decision are then computed from each expert's loss
+    averaged over those draws (the expected loss of the scene), so the routing target says which
+    expert suits the scene rather than which one happened to fit one noise draw. The expert loss
+    itself is still per row.
     """
     denom = mask.sum(dim=(1, 2)).clamp_min(1.0) if reduction == "mean" else 1.0
     per_sample = lambda pred: (((pred.float() - target) ** 2) * mask).sum(dim=(1, 2)) / denom  # noqa: E731
@@ -86,11 +93,17 @@ def demo_loss(reb, z, target, mask, project, temperature: float, null_enabled: b
         loss_null = per_sample(project(z))  # (B,)
     deltas = reb.deltas(z.float().mean(dim=1))  # (K, B, d): from the pooled h (supplement eq. 18)
     loss_k = torch.stack([per_sample(project(z + deltas[k][:, None, :])) for k in range(reb.k)], dim=1)  # (B, K)
-    w = F.softmax(-loss_k.detach() / temperature, dim=1)
+    if group > 1:
+        k = loss_k.shape[1]
+        ref_k = loss_k.detach().view(-1, group, k).mean(dim=1).repeat_interleave(group, dim=0)
+        ref_null = loss_null.view(-1, group).mean(dim=1).repeat_interleave(group, dim=0)
+    else:
+        ref_k, ref_null = loss_k.detach(), loss_null
+    w = F.softmax(-ref_k / temperature, dim=1)
     loss_expert = (w * loss_k).sum(dim=1).mean()
 
     if null_enabled:
-        q0 = (loss_k.detach().min(dim=1).values >= loss_null).float()
+        q0 = (ref_k.min(dim=1).values >= ref_null).float()
     else:  # Null-disabled warm-up: responsibility only among the residual experts
         q0 = torch.zeros_like(loss_null)
     q = torch.cat([q0[:, None], (1 - q0)[:, None] * w], dim=1)

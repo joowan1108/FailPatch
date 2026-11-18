@@ -53,6 +53,8 @@ case "$VARIANT" in
     # same objective as adapted_sum, trained on the larger demonstration set (run with
     # DEMO_DIR=demos_5k FEATURE_DIR=features_5k); a separate name keeps the earlier results
     adapted_sum_d5k) VARIANT_ARGS="--action-loss sum --margins task --margin-onset-chunks 5 --fail-temperature-scaling margin" ;;
+    # adapted_sum_d5k with responsibilities from the loss averaged over the draws of each scene
+    adapted_sum_d5k_scene) VARIANT_ARGS="--action-loss sum --margins task --margin-onset-chunks 5 --fail-temperature-scaling margin --demo-target scene" ;;
     *) echo "unknown VARIANT $VARIANT" >&2; exit 1 ;;
 esac
 
