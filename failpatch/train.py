@@ -184,6 +184,10 @@ def main():
     parser.add_argument("--live-samples", type=int, default=0,
                         help="--demo-live: distinct demonstration samples per step, each with batch-size / live-samples "
                              "(noise, time) draws (0 = batch-size samples with one draw each, as in the paper)")
+    parser.add_argument("--live-workers", type=int, default=16,
+                        help="--demo-live with one draw per sample: CPU worker processes that build the model inputs "
+                             "(failpatch.live_demo); the batch then goes through the VLM in one forward. 0 = the "
+                             "sample-by-sample path")
     parser.add_argument("--live-augment", default="xr1", choices=("xr1", "none"),
                         help="xr1: the colour augmentation of XR-1's training data loader (mibot JsonDataset._augment)")
     parser.add_argument("--seed", type=int, default=42)
@@ -308,6 +312,13 @@ def main():
 
     if args.demo_live and args.batch_size % (args.live_samples or args.batch_size):
         raise SystemExit("--batch-size must be a multiple of --live-samples")
+    loader = None
+    if args.demo_live and args.live_workers > 0 and (args.live_samples or args.batch_size) == args.batch_size:
+        from failpatch.live_demo import LiveDemoLoader
+        loader = LiveDemoLoader(adapter, args.model_path, args.xr1_repo, live, args.batch_size, args.live_workers,
+                                augment=args.live_augment != "none", seed=args.seed)
+        print(f"[train] live branch: {args.live_workers} CPU workers, batched forward of {args.batch_size} samples",
+              flush=True)
     feature_s = time.time() - tic
 
     # Monitoring set for the convergence test. By default it is a fixed subset of the TRAINING
@@ -706,7 +717,7 @@ def main():
         temperature = temperature_at(step)
         if args.demo_live:
             t_live = time.time()
-            z, target, mask = live_batch(args.batch_size)
+            z, target, mask = loader.next() if loader is not None else live_batch(args.batch_size)
             live_s += time.time() - t_live
             group = args.batch_size // (args.live_samples or args.batch_size) if args.demo_target == "scene" else 1
         else:
@@ -779,6 +790,8 @@ def main():
             val_log.flush()
             print("[val] step=%d %s" % (step, " ".join(f"{k[4:]}={v:.4g}" for k, v in metrics.items())), flush=True)
         save_train_state(step)
+    if loader is not None:
+        loader.close()
     final_val = evaluate() if converge else {}
     optimization_s = time.time() - tic
     log.close()
@@ -799,7 +812,8 @@ def main():
         buffer_chunks=buffer_stats, energy_scale=scale, geometry=geometry, action_loss=args.action_loss,
         margins=args.margins, null_margin=args.null_margin, redirect_margin=args.redirect_margin, task_margins=task_margins,
         redirect_bootstrap=args.redirect_bootstrap, resumed_from=resumed,
-        demo_live=dict(samples_per_step=args.live_samples or args.batch_size,
+        demo_live=dict(samples_per_step=args.live_samples or args.batch_size, batched=loader is not None,
+                       workers=args.live_workers if loader is not None else 0,
                        draws_per_sample=args.batch_size // (args.live_samples or args.batch_size),
                        augment=args.live_augment, live_forward_s=live_s) if args.demo_live else None, peak_gpu_memory_mib=torch.cuda.max_memory_allocated() / 2**20,
         final=stats,
