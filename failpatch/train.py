@@ -35,6 +35,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import time
 from pathlib import Path
 
@@ -83,6 +84,8 @@ def main():
     parser.add_argument("--model", required=True, choices=("xr1", "rldx"))
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--xr1-repo", default=None)
+    parser.add_argument("--action-expert", default=None,
+                        help="xr1: fine-tuned action-expert weights (failpatch.finetune) to load over the released ones")
     parser.add_argument("--tasks", nargs="+", required=True)
     parser.add_argument("--results", required=True, help="results/<model>: contains <task>/buffer, labels.json")
     parser.add_argument("--demos", required=True, help="directory with demos_<task>.npz")
@@ -122,6 +125,13 @@ def main():
     parser.add_argument("--val-draws", type=int, default=2, help="(noise, time) draws per held-out sample")
     parser.add_argument("--val-buffer-size", type=int, default=1024, help="H+ and H- rows per task for validation")
     parser.add_argument("--checkpoint-every", type=int, default=10_000)
+    parser.add_argument("--resume", default=None,
+                        help="continue a run: <run>/checkpoints/train_state.pt (exact: weights, optimizer, schedule, "
+                             "convergence history, RNG; the last checkpoint before the learning-rate decay, so a larger "
+                             "--max-steps continues as if the run had been started with it) or a plain "
+                             "<run>/checkpoints/reb_stepXXXXXX.pt (weights only: AdamW moments and RNG restart; the "
+                             "convergence history is rebuilt from <run>/val_log.jsonl). Logs up to that step are copied "
+                             "into --out; use a new --out to keep the original run")
     parser.add_argument("--warmup-steps", type=int, default=5_000, help="Null-disabled warm-up")
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=2.5e-5, help="peak learning rate")
@@ -167,9 +177,22 @@ def main():
                         help="norm that residual energies ||delta h||^2 are measured against; 'auto' = mean norm of "
                              "the cached action hidden representations, '1' = raw energies as written in the paper")
     parser.add_argument("--demo-only", action="store_true", help="Demo-Only REB baseline of the paper")
+    parser.add_argument("--demo-live", action="store_true",
+                        help="paper (S1.3): the demonstration branch runs a live forward pass through the frozen VLA "
+                             "at every step, with fresh (noise, time) draws and the base policy's image augmentation, "
+                             "instead of reusing cached features")
+    parser.add_argument("--live-samples", type=int, default=0,
+                        help="--demo-live: distinct demonstration samples per step, each with batch-size / live-samples "
+                             "(noise, time) draws (0 = batch-size samples with one draw each, as in the paper)")
+    parser.add_argument("--live-augment", default="xr1", choices=("xr1", "none"),
+                        help="xr1: the colour augmentation of XR-1's training data loader (mibot JsonDataset._augment)")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--cpu-threads", type=int, default=16,
+                        help="torch CPU threads; the default of one per core (256 on the instance) makes the per-sample "
+                             "image operations of --demo-live ~9x slower")
     args = parser.parse_args()
 
+    torch.set_num_threads(args.cpu_threads)
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     out = Path(args.out)
@@ -196,7 +219,17 @@ def main():
 
     demo_idx = {task: demo_index(task) for task in args.tasks}
     suffix = f"_n{args.demo_samples}" if args.demo_samples > 0 else ""
+    live = {}  # --demo-live: task -> raw demonstration samples
     for task in args.tasks:
+        if args.demo_live:
+            data = np.load(Path(args.demos) / f"demos_{task}.npz")
+            if list(data["frame_deltas"]) != list(adapter.frame_deltas):
+                raise RuntimeError(f"demo frames {list(data['frame_deltas'])} != model frames {adapter.frame_deltas}")
+            keys = [k for k in data.files if k.startswith(("video.", "state."))]
+            live[task] = dict(arrays={k: data[k] for k in keys}, keys=keys, instructions=data["instructions"],
+                              actions=data["actions"], episode_ids=data["episode_ids"], pool=demo_idx[task])
+            print(f"[train] demos {task}: {len(demo_idx[task])} samples kept in memory for the live branch", flush=True)
+            continue
         cache_file = cache_dir / f"demo_features_{task}_draws{args.draws}{suffix}.pt" if cache_dir else None
         if cache_file is not None and cache_file.exists():
             # The frozen features do not depend on the training variant, so variants share them.
@@ -226,6 +259,55 @@ def main():
         if cache_file is not None:
             cache_dir.mkdir(parents=True, exist_ok=True)
             torch.save(demo[task], cache_file)
+    aug_rng = np.random.default_rng(args.seed)
+
+    def augment(frames: list[dict]) -> list[dict]:
+        """XR-1's training-time image augmentation (mibot JsonDataset._augment): brightness
+        1 + U(-32/255, 32/255), contrast U(0.5, 1.5), saturation U(0.5, 1.5) (hue 0), each applied with
+        probability 1/2, with the same draw for every image of the sample. XR-1 applies it after its
+        resize; here it is applied to the raw frames before the official preprocessing."""
+        import torchvision.transforms.functional as TF
+        ops = [(TF.adjust_brightness, 1.0 + aug_rng.uniform(-32 / 255, 32 / 255)),
+               (TF.adjust_contrast, aug_rng.uniform(0.5, 1.5)), (TF.adjust_saturation, aug_rng.uniform(0.5, 1.5))]
+        use = [aug_rng.integers(0, 2) == 0 for _ in ops]
+        out = []
+        for f in frames:
+            g = dict(f)
+            for k, v in f.items():
+                if k.startswith("video."):
+                    img = torch.from_numpy(np.ascontiguousarray(v)).permute(2, 0, 1)
+                    for u, (op, value) in zip(use, ops):
+                        if u:
+                            img = op(img, float(value))
+                    g[k] = img.permute(1, 2, 0).numpy()
+            out.append(g)
+        return out
+
+    def live_features(task: str, i: int, draws: int, augment: bool):
+        L = live[task]
+        frames = [{k: L["arrays"][k][i, j] for k in L["keys"]} for j in range(len(adapter.frame_deltas))]
+        if augment and args.live_augment != "none":
+            frames = augment_frames(frames)
+        sample = dict(frames=frames, instruction=str(L["instructions"][i]), actions=L["actions"][i])
+        return adapter.demo_features(sample, draws)
+
+    augment_frames = augment
+    live_s = 0.0
+
+    def live_batch(n: int):
+        """Task-balanced batch of live demonstration rows: `samples` distinct samples x draws each."""
+        samples = args.live_samples or n
+        draws = n // samples
+        tasks = list(live)
+        picks = [tasks[i % len(tasks)] for i in torch.randperm(samples).tolist()]
+        rows = []
+        for task in picks:
+            i = int(aug_rng.choice(live[task]["pool"]))
+            rows.append(live_features(task, i, draws, augment=True))
+        return tuple(torch.cat(col).to(device).float() for col in zip(*rows))
+
+    if args.demo_live and args.batch_size % (args.live_samples or args.batch_size):
+        raise SystemExit("--batch-size must be a multiple of --live-samples")
     feature_s = time.time() - tic
 
     # Monitoring set for the convergence test. By default it is a fixed subset of the TRAINING
@@ -236,7 +318,28 @@ def main():
     # The cached features are stored sample by sample, `--draws` rows each, in the order of
     # demos_<task>.npz (sorted by demonstration).
     val_demo, val_info = {}, {}
-    if args.schedule == "converge":
+    if args.schedule == "converge" and args.demo_live:
+        # fixed monitoring features (no augmentation, fixed draws), computed once
+        with torch.random.fork_rng():
+            torch.manual_seed(args.seed + 1)
+            for task, L in live.items():
+                eps = L["episode_ids"][L["pool"]]
+                episodes = sorted(set(eps.tolist()))
+                if args.val_demo_fraction > 0:
+                    n_val = max(1, round(args.val_demo_fraction * len(episodes)))
+                    held = np.isin(eps, episodes[-n_val:])
+                    L["pool"] = L["pool"][~held]
+                    val_info[task] = dict(source="held-out demonstrations", val_demonstrations=n_val,
+                                          train_demonstrations=len(episodes) - n_val, val_samples=int(held.sum()))
+                else:
+                    held = np.arange(len(eps)) % args.monitor_every == 0
+                    val_info[task] = dict(source="fixed subset of the training demonstrations",
+                                          train_demonstrations=len(episodes), val_samples=int(held.sum()))
+                rows = [live_features(task, int(i), args.val_draws, augment=False) for i in demo_idx[task][held]]
+                val_demo[task] = tuple(torch.cat(col) for col in zip(*rows))
+                val_info[task]["val_rows"] = len(val_demo[task][0])
+        print(f"[train] convergence monitoring set (live branch): {val_info}", flush=True)
+    elif args.schedule == "converge":
         for task in args.tasks:
             z, target, mask = demo[task]
             episode_ids = np.load(Path(args.demos) / f"demos_{task}.npz")["episode_ids"][demo_idx[task]]
@@ -259,7 +362,7 @@ def main():
             val_demo[task] = (z[rows & first], target[rows & first], mask[rows & first])
             val_info[task]["val_rows"] = int((rows & first).sum())
         print(f"[train] convergence monitoring set: {val_info}", flush=True)
-    n_draws = sum(len(v[0]) for v in demo.values())
+    n_draws = sum(len(v[0]) for v in demo.values()) if not args.demo_live else 0
     print(f"[train] demo features: {n_draws} (sample, noise, time) draws in {feature_s:.0f}s", flush=True)
 
     # ---- deployment buffer: H+, H- and local success prototypes -------------------------
@@ -531,18 +634,87 @@ def main():
     ckpt_dir = out / "checkpoints"
     tic = time.time()
     eval_s = 0.0
+
+    def save_train_state(step: int):
+        """Full training state at a checkpoint step, kept only while the learning rate has not decayed yet
+        (decay decided at this very step is still undone), so resuming with a larger --max-steps is exact."""
+        if not (args.checkpoint_every and step % args.checkpoint_every == 0):
+            return
+        if decay["start"] is not None and decay["start"] != step:
+            return
+        ckpt_dir.mkdir(exist_ok=True)
+        torch.save(dict(step=step, reb=reb.state_dict(), opt=opt.state_dict(), decay=dict(decay), history=history,
+                        best=dict(best), margin_history=margin_history, eval_s=eval_s, elapsed_s=time.time() - tic,
+                        rng_cpu=torch.get_rng_state(), rng_cuda=torch.cuda.get_rng_state_all(),
+                        rng_aug=aug_rng.bit_generator.state, live_s=live_s, args=vars(args)),
+                   ckpt_dir / "train_state.tmp")
+        os.replace(ckpt_dir / "train_state.tmp", ckpt_dir / "train_state.pt")
+
+    start_step, resumed = 0, None
+    old_logs = {"train_log.jsonl": [], "val_log.jsonl": []}
+    if args.resume:
+        src = Path(args.resume)
+        run_dir = src.parent.parent if src.parent.name == "checkpoints" else src.parent
+        state = torch.load(src, map_location="cpu", weights_only=False)
+        start_step = int(state["step"])
+        saved_args = state.get("args", {})
+        ignore = {"resume", "out", "max_steps"}
+        diff = {k: (saved_args.get(k), v) for k, v in vars(args).items() if k not in ignore and k in saved_args and saved_args[k] != v}
+        if diff:
+            raise SystemExit(f"[train] --resume: arguments differ from the original run (saved, now): {diff}")
+        for name in old_logs:
+            if (run_dir / name).exists():
+                old_logs[name] = [l for l in (run_dir / name).read_text().splitlines()
+                                  if l.strip() and json.loads(l).get("step", 0) <= start_step]
+        if "opt" in state:
+            reb.load_state_dict(state["reb"])
+            opt.load_state_dict(state["opt"])
+            decay.update(state["decay"])
+            if decay["start"] is not None and decay["reason"] == "max_steps" and args.max_steps > saved_args.get("max_steps", 0):
+                decay.update(start=None, length=None, reason=None, converged_at=None)  # decayed only for the old limit
+            history.extend(state["history"]); best.update(state["best"]); margin_history.extend(state["margin_history"])
+            torch.set_rng_state(state["rng_cpu"]); torch.cuda.set_rng_state_all(state["rng_cuda"])
+            if "rng_aug" in state:
+                aug_rng.bit_generator.state = state["rng_aug"]
+            live_s = state.get("live_s", 0.0)
+            eval_s, tic, kind = state["eval_s"], time.time() - state["elapsed_s"], "full"
+        else:
+            reb.load_state_dict(state["state_dict"])
+            for l in old_logs["val_log.jsonl"]:
+                row = json.loads(l)
+                metrics = {k: v for k, v in row.items() if k.startswith("val_")}
+                history.append((row["step"], metrics))
+                if metrics.get("val_objective", float("inf")) < best["objective"]:
+                    best.update(objective=metrics["val_objective"], step=row["step"])
+            if old_logs["train_log.jsonl"]:
+                tic = time.time() - json.loads(old_logs["train_log.jsonl"][-1]).get("elapsed_s", 0.0)
+            kind = "weights-only"
+        update_noise_floor_margins(start_step)
+        resumed = dict(path=str(src), step=start_step, kind=kind, original_max_steps=saved_args.get("max_steps"))
+        print(f"[train] resumed from {src} at step {start_step} ({kind}); decay {decay}", flush=True)
     log = (out / "train_log.jsonl").open("w")
     val_log = (out / "val_log.jsonl").open("w")
-    step = 0
+    for name, f in (("train_log.jsonl", log), ("val_log.jsonl", val_log)):
+        for l in old_logs[name]:
+            f.write(l + "\n")
+        f.flush()
+    step = start_step
     while True:
         step += 1
         if step == 1 or step % args.margin_update_every == 0:
             update_noise_floor_margins(step)
         temperature = temperature_at(step)
-        z, target, mask = sample_scenes(demo, args.batch_size) if args.demo_target == "scene" else sample(demo, args.batch_size)
+        if args.demo_live:
+            t_live = time.time()
+            z, target, mask = live_batch(args.batch_size)
+            live_s += time.time() - t_live
+            group = args.batch_size // (args.live_samples or args.batch_size) if args.demo_target == "scene" else 1
+        else:
+            z, target, mask = sample_scenes(demo, args.batch_size) if args.demo_target == "scene" else sample(demo, args.batch_size)
+            group = args.draws if args.demo_target == "scene" else 1
         l_expert, l_router, stats = demo_loss(reb, z, target, mask, adapter.project, temperature,
                                               null_enabled=step > args.warmup_steps, reduction=args.action_loss,
-                                              group=args.draws if args.demo_target == "scene" else 1)
+                                              group=group)
         loss = l_expert + args.lambda_rd * l_router
         stats.update(expert=float(l_expert), router_demo=float(l_router))
         if plus:
@@ -565,6 +737,8 @@ def main():
         opt.step()
         if step % 200 == 0 or step == 1:
             stats.update(step=step, loss=float(loss), lr=lr, temperature=temperature, elapsed_s=time.time() - tic)
+            if args.demo_live:
+                stats["live_forward_s"] = live_s
             log.write(json.dumps(stats) + "\n")
             log.flush()
             if step % 2000 == 0 or step == 1:
@@ -578,6 +752,7 @@ def main():
             if step >= args.steps:
                 decay.update(reason="fixed_steps")
                 break
+            save_train_state(step)
             continue
         if decay["start"] is not None and step >= decay["start"] + decay["length"]:
             break
@@ -603,6 +778,7 @@ def main():
             val_log.write(json.dumps(dict(step=step, lr=lr, temperature=temperature, **metrics, **info, **mrg)) + "\n")
             val_log.flush()
             print("[val] step=%d %s" % (step, " ".join(f"{k[4:]}={v:.4g}" for k, v in metrics.items())), flush=True)
+        save_train_state(step)
     final_val = evaluate() if converge else {}
     optimization_s = time.time() - tic
     log.close()
@@ -622,7 +798,10 @@ def main():
         trainable_params=n_params, trainable_fraction=n_params / vla_params,
         buffer_chunks=buffer_stats, energy_scale=scale, geometry=geometry, action_loss=args.action_loss,
         margins=args.margins, null_margin=args.null_margin, redirect_margin=args.redirect_margin, task_margins=task_margins,
-        redirect_bootstrap=args.redirect_bootstrap, peak_gpu_memory_mib=torch.cuda.max_memory_allocated() / 2**20,
+        redirect_bootstrap=args.redirect_bootstrap, resumed_from=resumed,
+        demo_live=dict(samples_per_step=args.live_samples or args.batch_size,
+                       draws_per_sample=args.batch_size // (args.live_samples or args.batch_size),
+                       augment=args.live_augment, live_forward_s=live_s) if args.demo_live else None, peak_gpu_memory_mib=torch.cuda.max_memory_allocated() / 2**20,
         final=stats,
     )
     (out / "train_summary.json").write_text(json.dumps(summary, indent=2))
