@@ -188,6 +188,10 @@ def main():
                         help="--demo-live with one draw per sample: CPU worker processes that build the model inputs "
                              "(failpatch.live_demo); the batch then goes through the VLM in one forward. 0 = the "
                              "sample-by-sample path")
+    parser.add_argument("--live-check", type=float, default=0.03,
+                        help="before training, compare the batched live forward with the per-sample one on 4 samples "
+                             "(same draws); above this relative hidden-state difference, fall back to the per-sample "
+                             "path. 0 disables the check")
     parser.add_argument("--live-augment", default="xr1", choices=("xr1", "none"),
                         help="xr1: the colour augmentation of XR-1's training data loader (mibot JsonDataset._augment)")
     parser.add_argument("--seed", type=int, default=42)
@@ -312,13 +316,24 @@ def main():
 
     if args.demo_live and args.batch_size % (args.live_samples or args.batch_size):
         raise SystemExit("--batch-size must be a multiple of --live-samples")
-    loader = None
+    loader, live_check = None, None
     if args.demo_live and args.live_workers > 0 and (args.live_samples or args.batch_size) == args.batch_size:
         from failpatch.live_demo import LiveDemoLoader
         loader = LiveDemoLoader(adapter, args.model_path, args.xr1_repo, live, args.batch_size, args.live_workers,
                                 augment=args.live_augment != "none", seed=args.seed)
         print(f"[train] live branch: {args.live_workers} CPU workers, batched forward of {args.batch_size} samples",
               flush=True)
+        if args.live_check > 0:
+            from failpatch.live_demo import check_equivalence
+            live_check = check_equivalence(adapter, args.model_path, args.xr1_repo, live, n=4)
+            worst = max(live_check["rel_diff_batched_vs_single"])
+            live_check["passed"] = worst <= args.live_check
+            print(f"[train] live batched-vs-single check: {live_check}", flush=True)
+            if not live_check["passed"]:
+                print(f"[train] WARNING: batched live forward differs by {worst:.4f} > {args.live_check}; "
+                      f"falling back to the per-sample path", flush=True)
+                loader.close()
+                loader = None
     feature_s = time.time() - tic
 
     # Monitoring set for the convergence test. By default it is a fixed subset of the TRAINING
@@ -812,7 +827,7 @@ def main():
         buffer_chunks=buffer_stats, energy_scale=scale, geometry=geometry, action_loss=args.action_loss,
         margins=args.margins, null_margin=args.null_margin, redirect_margin=args.redirect_margin, task_margins=task_margins,
         redirect_bootstrap=args.redirect_bootstrap, resumed_from=resumed,
-        demo_live=dict(samples_per_step=args.live_samples or args.batch_size, batched=loader is not None,
+        demo_live=dict(samples_per_step=args.live_samples or args.batch_size, batched=loader is not None, check=live_check,
                        workers=args.live_workers if loader is not None else 0,
                        draws_per_sample=args.batch_size // (args.live_samples or args.batch_size),
                        augment=args.live_augment, live_forward_s=live_s) if args.demo_live else None, peak_gpu_memory_mib=torch.cuda.max_memory_allocated() / 2**20,

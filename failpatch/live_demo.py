@@ -215,8 +215,7 @@ def check_equivalence(adapter, model_path: str, repo: str, live: dict, n: int = 
     z_batch, target_batch, _ = demo_forward_batch(adapter, inputs, actions, noise, t)
     diffs = []
     for b in range(n):
-        single = {k: (v[b:b + 1] if k in ("state", "action_mask") else v) for k, v in results[b][2].items()}
-        z1, target1, _ = demo_forward_batch(adapter, single, [actions[b]], noise[b:b + 1], t[b:b + 1])
+        z1, target1, _ = demo_forward_batch(adapter, results[b][2], [actions[b]], noise[b:b + 1], t[b:b + 1])
         rel = float((z_batch[b] - z1[0]).norm() / z1[0].norm())
         diffs.append(rel)
         assert torch.allclose(target_batch[b], target1[0])
