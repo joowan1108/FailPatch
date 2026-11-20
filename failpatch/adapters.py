@@ -89,7 +89,11 @@ class XR1Adapter:
     name = "xr1"
     robot_type = "robocasa365"
 
-    def __init__(self, model_path: str, repo: str, obs_history=4, obs_interval=2, crop_ratio=0.95, exec_steps=16):
+    # The action expert: everything except the VLM (DiT, its projections, timestep embedding, attention sink).
+    ACTION_EXPERT = ("dit", "state_projector", "action_projector", "action_output_layer", "t_embedder", "t_projector", "sink")
+
+    def __init__(self, model_path: str, repo: str, obs_history=4, obs_interval=2, crop_ratio=0.95, exec_steps=16,
+                 action_expert: str | None = None):
         repo = Path(repo).resolve()
         sys.path.insert(0, str(repo / "deploy"))
         sys.path.insert(0, str(repo / "eval_robocasa365"))
@@ -103,6 +107,8 @@ class XR1Adapter:
                 model_path, trust_remote_code=True, attn_implementation="flash_attention_2", dtype=torch.bfloat16
             ).cuda().to(torch.bfloat16).eval()
         )
+        if action_expert:  # fine-tuned action-expert weights (failpatch.finetune) replace the released ones
+            self.load_action_expert(action_expert)
         # Reuse EvalClient.infer for preprocessing; its socket client is replaced by `self._call`.
         self.client = entry.EvalClient.__new__(entry.EvalClient)
         self.client.client = self._call
@@ -121,6 +127,16 @@ class XR1Adapter:
         self.hook = HiddenHook(self.model.action_output_layer, self.horizon)
         self._demo = None  # set while extracting demo features
 
+    def load_action_expert(self, path: str) -> None:
+        state = torch.load(path, map_location="cpu", weights_only=True)
+        state = state.get("state_dict", state)
+        own = {k for k in self.model.state_dict() if k.split(".")[0] in self.ACTION_EXPERT}
+        if set(state) != own:
+            raise RuntimeError(f"{path}: action-expert keys differ (missing {sorted(own - set(state))[:5]}, "
+                               f"unexpected {sorted(set(state) - own)[:5]})")
+        self.model.load_state_dict({k: v.to(torch.bfloat16) for k, v in state.items()}, strict=False)
+        print(f"[xr1] action expert loaded from {path}", flush=True)
+
     # -- shared preprocessing ------------------------------------------------------------
     def _to_device(self, data: dict) -> dict:
         m = self.model  # same placement rule as deploy/server.py
@@ -136,7 +152,10 @@ class XR1Adapter:
         if self._demo is None:
             outputs = self.model(**data)
             return self.processor.decode_action(outputs.actions.cpu(), robot_type=robot_type)
-        self._demo["out"] = self._demo_forward(data, self._demo["actions"], self._demo["draws"])
+        if self._demo.get("inputs_only"):
+            self._demo["out"] = data
+        else:
+            self._demo["out"] = self._demo_forward(data, self._demo["actions"], self._demo["draws"])
         return torch.zeros(1, self.horizon, self.action_width)
 
     def _infer_one(self, obs: dict) -> np.ndarray:
@@ -183,10 +202,8 @@ class XR1Adapter:
         attn_mask = torch.cat([cache_mask, dit_mask], dim=-1)[:, None].bool()
         state_embed = model.state_projector(state)
 
-        clean = torch.zeros(self.horizon, self.action_width)
-        clean[:, : actions.shape[1]] = torch.from_numpy(actions).float()
         mask = action_mask[0].float().cpu()
-        clean = torch.where(mask > 0, (clean - self.act_mean) / self.act_std.clamp_min(1e-5), torch.zeros_like(clean))
+        clean = self.normalize_actions(actions, mask)
         beta = torch.distributions.Beta(1.5, 1.0)
         zs, targets = [], []
         for _ in range(draws):
@@ -200,6 +217,22 @@ class XR1Adapter:
                 zs.append(self.hook.tokens[0].cpu())
             targets.append(clean - noise)
         return torch.stack(zs), torch.stack(targets), mask[None].expand(draws, -1, -1).clone()
+
+    def model_inputs(self, sample: dict) -> dict:
+        """The processed model inputs of one observation (on the GPU), as the official pipeline builds them."""
+        self._demo = dict(inputs_only=True)
+        try:
+            self._infer_one(sample)
+            return self._demo["out"]
+        finally:
+            self._demo = None
+
+    def normalize_actions(self, actions: np.ndarray, mask: torch.Tensor) -> torch.Tensor:
+        """Env-order action chunk (H, 12) -> normalised model action (H, D), zero outside the mask."""
+        clean = torch.zeros(self.horizon, self.action_width)
+        clean[:, : actions.shape[1]] = torch.from_numpy(np.asarray(actions, np.float32))
+        mask = mask.float().cpu()
+        return torch.where(mask > 0, (clean - self.act_mean) / self.act_std.clamp_min(1e-5), torch.zeros_like(clean))
 
     def demo_features(self, sample: dict, draws: int):
         self._demo = dict(actions=np.asarray(sample["actions"], np.float32), draws=draws)
@@ -308,7 +341,7 @@ class RLDXAdapter:
 
 def build(name: str, args) -> "XR1Adapter | RLDXAdapter":
     if name == "xr1":
-        return XR1Adapter(args.model_path, args.xr1_repo)
+        return XR1Adapter(args.model_path, args.xr1_repo, action_expert=getattr(args, "action_expert", None))
     if name == "rldx":
         return RLDXAdapter(args.model_path)
     raise ValueError(name)

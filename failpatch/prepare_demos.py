@@ -46,11 +46,16 @@ def main():
     parser.add_argument("--num-demos", type=int, default=50)
     parser.add_argument("--samples", type=int, default=1000, help="anchor steps for this task")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--root", default=None,
+                        help="LeRobot dataset directory to read instead of the registered human demonstrations "
+                             "(e.g. MimicGen demonstrations generated in one fixed kitchen)")
     args = parser.parse_args()
 
-    from robocasa.utils.dataset_registry_utils import get_ds_path
-
-    root = Path(get_ds_path(args.task, source="human", split=args.split))
+    if args.root is not None:
+        root = Path(args.root)
+    else:
+        from robocasa.utils.dataset_registry_utils import get_ds_path
+        root = Path(get_ds_path(args.task, source="human", split=args.split))
     if not (root / "meta").exists():
         raise FileNotFoundError(f"{root}: run setup/download.sh (demo datasets) first")
     info = json.loads((root / "meta/info.json").read_text())

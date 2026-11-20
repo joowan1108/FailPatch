@@ -28,6 +28,8 @@ def main():
     parser.add_argument("--model", required=True, choices=("xr1", "rldx"))
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--xr1-repo", default=None)
+    parser.add_argument("--action-expert", default=None,
+                        help="xr1: fine-tuned action-expert weights (failpatch.finetune) to load over the released ones")
     parser.add_argument("--reb", default=None, help="trained REB checkpoint; omit for the base policy")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=10086)
